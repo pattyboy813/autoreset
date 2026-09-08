@@ -328,6 +328,7 @@ Describe 'Content-based cache and archive refresh' {
         Mock Write-Aside { }
         Mock Write-BuildLog { }
         $script:RuntimeExtractor = $null
+        $DriverCompression = 'Fast'
         $WorkDir = Join-Path $TestDrive 'work'
         $script:DriverSource = Join-Path $TestDrive ('driver-source-' + [guid]::NewGuid().ToString('N'))
         $script:ArchiveDir = Join-Path $TestDrive ('archives-' + [guid]::NewGuid().ToString('N'))
@@ -413,8 +414,9 @@ Describe 'Content-based cache and archive refresh' {
         { Assert-RuntimeExtractor -Path $extractor } | Should -Throw '*not guaranteed in WinPE*'
         Should -Invoke Invoke-Tool -Times 1
     }
-    It 'tests both fresh and cached 7z archives using the bundled extractor' {
+    It 'tests a fresh 7z once and trusts only a content-verified successful receipt on reuse' {
         $script:RuntimeExtractor = Join-Path $TestDrive '7za.exe'
+        [IO.File]::WriteAllText($script:RuntimeExtractor, 'extractor fixture')
         Mock Invoke-Tool {
             if ($ArgumentList[0] -eq 'a') {
                 [IO.File]::WriteAllText($ArgumentList[-2], 'archive')
@@ -423,11 +425,12 @@ Describe 'Content-based cache and archive refresh' {
         $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir
         $archive | Should -BeLike '*.7z'
         $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir
-        Should -Invoke Invoke-Tool -Times 2 -ParameterFilter { $ArgumentList[0] -eq 't' -and $FilePath -eq $script:RuntimeExtractor }
+        Should -Invoke Invoke-Tool -Times 1 -Exactly -ParameterFilter { $ArgumentList[0] -eq 't' -and $FilePath -eq $script:RuntimeExtractor }
         Should -Invoke Invoke-Tool -Times 1 -ParameterFilter { $ArgumentList[0] -eq 'a' }
     }
     It 'fails before publishing an archive the runtime cannot extract' {
         $script:RuntimeExtractor = Join-Path $TestDrive '7za.exe'
+        [IO.File]::WriteAllText($script:RuntimeExtractor, 'extractor fixture')
         Mock Invoke-Tool {
             if ($ArgumentList[0] -eq 'a') { [IO.File]::WriteAllText($ArgumentList[-2], 'archive') }
             else { throw 'runtime cannot extract archive' }
@@ -435,6 +438,253 @@ Describe 'Content-based cache and archive refresh' {
         { Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir } |
             Should -Throw '*runtime cannot extract*'
         Test-Path -LiteralPath (Join-Path $script:ArchiveDir 'Drivers.7z') | Should -BeFalse
+    }
+    It 'uses <Compression> 7z settings without imposing Maximum settings on fast builds' -ForEach @(
+        @{ Compression = 'Fast'; Level = '-mx=1' }
+        @{ Compression = 'Balanced'; Level = '-mx=5' }
+        @{ Compression = 'Maximum'; Level = '-mx=9' }
+    ) {
+        $script:RuntimeExtractor = Join-Path $TestDrive '7za.exe'
+        [IO.File]::WriteAllText($script:RuntimeExtractor, 'extractor')
+        Mock Invoke-Tool {
+            if ($ArgumentList[0] -eq 'a') { [IO.File]::WriteAllText($ArgumentList[-2], 'archive') }
+        }
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression $Compression
+        Should -Invoke Invoke-Tool -Times 1 -Exactly -ParameterFilter {
+            $ArgumentList[0] -eq 'a' -and $ArgumentList -contains '-m0=lzma2' -and $ArgumentList -contains $Level
+        }
+        if ($Compression -ne 'Maximum') {
+            Should -Invoke Invoke-Tool -Times 0 -ParameterFilter { $ArgumentList -contains '-md=128m' -or $ArgumentList -contains '-mfb=273' }
+        }
+    }
+    It 'rebuilds and retests when extractor bytes change despite identical timestamps and lengths' {
+        $script:RuntimeExtractor = Join-Path $TestDrive '7za.exe'
+        [IO.File]::WriteAllText($script:RuntimeExtractor, 'extractor-a')
+        Mock Invoke-Tool {
+            if ($ArgumentList[0] -eq 'a') { [IO.File]::WriteAllText($ArgumentList[-2], 'archive') }
+        }
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir
+        $stamp = (Get-Item -LiteralPath $script:RuntimeExtractor).LastWriteTimeUtc
+        [IO.File]::WriteAllText($script:RuntimeExtractor, 'extractor-b')
+        (Get-Item -LiteralPath $script:RuntimeExtractor).LastWriteTimeUtc = $stamp
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir
+        Should -Invoke Invoke-Tool -Times 2 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'a' }
+        Should -Invoke Invoke-Tool -Times 2 -Exactly -ParameterFilter { $ArgumentList[0] -eq 't' }
+        Test-Path -LiteralPath "$archive.hash" | Should -BeTrue
+    }
+    It 'rebuilds and retests when the compression profile or successful receipt changes' {
+        $script:RuntimeExtractor = Join-Path $TestDrive '7za.exe'
+        [IO.File]::WriteAllText($script:RuntimeExtractor, 'extractor')
+        Mock Invoke-Tool {
+            if ($ArgumentList[0] -eq 'a') { [IO.File]::WriteAllText($ArgumentList[-2], 'archive') }
+        }
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression Fast
+        $firstReceipt = Get-Content -LiteralPath "$archive.hash" -Raw
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression Balanced
+        Get-Content -LiteralPath "$archive.hash" -Raw | Should -Not -Be $firstReceipt
+        Set-Content -LiteralPath "$archive.hash" -Value 'malformed'
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression Balanced
+        Should -Invoke Invoke-Tool -Times 3 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'a' }
+        Should -Invoke Invoke-Tool -Times 3 -Exactly -ParameterFilter { $ArgumentList[0] -eq 't' }
+    }
+    It 'retains content corruption detection after a successful 7z test' {
+        $script:RuntimeExtractor = Join-Path $TestDrive '7za.exe'
+        [IO.File]::WriteAllText($script:RuntimeExtractor, 'extractor')
+        Mock Invoke-Tool {
+            if ($ArgumentList[0] -eq 'a') { [IO.File]::WriteAllText($ArgumentList[-2], 'archive') }
+        }
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir
+        $stamp = (Get-Item -LiteralPath $archive).LastWriteTimeUtc
+        [IO.File]::WriteAllText($archive, 'corrupt')
+        (Get-Item -LiteralPath $archive).LastWriteTimeUtc = $stamp
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir
+        Should -Invoke Invoke-Tool -Times 2 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'a' }
+        Should -Invoke Invoke-Tool -Times 2 -Exactly -ParameterFilter { $ArgumentList[0] -eq 't' }
+        [IO.File]::ReadAllText($archive) | Should -Be 'archive'
+    }
+    It 'includes the ZIP profile in its cache identity' {
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression Fast
+        $firstReceipt = Get-Content -LiteralPath "$archive.hash" -Raw
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression Balanced
+        Get-Content -LiteralPath "$archive.hash" -Raw | Should -Not -Be $firstReceipt
+        $source = (Get-Command Invoke-DriverArchive).Definition
+        $source | Should -Match "Compression -eq 'Fast'.*'Fastest'.*'Optimal'"
+    }
+}
+
+Describe 'Two-level WIM servicing integration with mocked DISM' {
+    BeforeEach {
+        Mock Start-Step { }
+        Mock Write-StepDone { }
+        Mock Write-StepSkipped { }
+        Mock Write-BuildLog { }
+        $script:BuildPhases = @{}
+        $script:OwnedWorkspace = Join-Path $TestDrive ('AutoReset-Build-' + [guid]::NewGuid().ToString('N'))
+        $script:DismPath = 'dism.exe'
+        $cache = Join-Path $TestDrive ('cache-' + [guid]::NewGuid().ToString('N'))
+        $script:SourceWim = Join-Path $TestDrive 'adk.wim'
+        $script:WorkingWim = Join-Path $script:OwnedWorkspace 'boot.wim'
+        $script:ImageMount = Join-Path $script:OwnedWorkspace 'mount'
+        $script:BootDrivers = Join-Path $TestDrive 'boot-drivers'
+        New-Item -ItemType Directory -Path $script:OwnedWorkspace, $script:ImageMount, $script:BootDrivers -Force | Out-Null
+        [IO.File]::WriteAllText($script:SourceWim, 'ADK')
+        [IO.File]::WriteAllText((Join-Path $script:BootDrivers 'boot.inf'), 'driver-a')
+        $script:Plan = Get-WinPECachePlan -CacheDirectory $cache -BaseParts @('adk', (Get-ContentTreeHash $script:BootDrivers)) -RuntimeParts @('runtime-a')
+        $script:BuildArgs = @{
+            CachePlan = $script:Plan; SourceWim = $script:SourceWim; BootWim = $script:WorkingWim
+            MountPath = $script:ImageMount; DriverPath = $script:BootDrivers
+            PackagePaths = @('WinPE-WMI.cab', 'WinPE-WMI_en-us.cab', 'WinPE-NetFx.cab')
+            RuntimeFiles = @(); PayloadSource = $TestDrive; BootsectSource = 'bootsect.exe'
+        }
+        $script:ImageMounted = $false
+        $script:PackageOrder = [Collections.Generic.List[string]]::new()
+        Mock Get-WindowsImage {
+            if ($script:ImageMounted) {
+                [pscustomobject]@{ Path = $script:ImageMount; ImagePath = $script:WorkingWim }
+            }
+        }
+        Mock Invoke-Tool {
+            if ($ArgumentList -contains '/Mount-Image') {
+                $ArgumentList | Should -Contain "/ImageFile:$script:WorkingWim"
+                $script:ImageMounted = $true
+            }
+            elseif ($ArgumentList -contains '/Unmount-Image') { $script:ImageMounted = $false }
+            elseif ($ArgumentList -contains '/Add-Package') {
+                $package = ($ArgumentList | Where-Object { $_ -like '/PackagePath:*' }).Substring(13)
+                $script:PackageOrder.Add($package)
+                [IO.File]::AppendAllText($script:WorkingWim, "|$package")
+            }
+            elseif ($ArgumentList -contains '/Add-Driver') { [IO.File]::AppendAllText($script:WorkingWim, '|drivers') }
+        }
+        Mock Sync-RuntimePayload { [IO.File]::AppendAllText($script:WorkingWim, '|runtime') }
+        Mock Set-WinPEStartup { }
+    }
+    It 'publishes a dismounted base before runtime customization, preserving package order and boot drivers' {
+        @(Invoke-WinPEImageBuild @script:BuildArgs).Count | Should -Be 0
+        Test-WinPECacheImage $script:Plan.BasePath | Should -BeTrue
+        Test-WinPECacheImage $script:Plan.FinalPath | Should -BeTrue
+        [IO.File]::ReadAllText($script:Plan.BasePath) | Should -Not -Match 'runtime'
+        [IO.File]::ReadAllText($script:Plan.FinalPath) | Should -Match 'runtime'
+        @($script:PackageOrder) | Should -Be $script:BuildArgs.PackagePaths
+        Should -Invoke Invoke-Tool -Times 2 -Exactly -ParameterFilter { $ArgumentList -contains '/Mount-Image' }
+        Should -Invoke Invoke-Tool -Times 2 -Exactly -ParameterFilter { $ArgumentList -contains '/Commit' }
+        Should -Invoke Invoke-Tool -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains '/Add-Driver' }
+        Should -Invoke Invoke-Tool -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains '/Set-ScratchSpace:512' }
+    }
+    It 'restores an identical final build without another mount or package installation' {
+        Invoke-WinPEImageBuild @script:BuildArgs
+        Invoke-WinPEImageBuild @script:BuildArgs
+        Should -Invoke Invoke-Tool -Times 2 -Exactly -ParameterFilter { $ArgumentList -contains '/Mount-Image' }
+        Should -Invoke Invoke-Tool -Times 3 -Exactly -ParameterFilter { $ArgumentList -contains '/Add-Package' }
+        Should -Invoke Sync-RuntimePayload -Times 1 -Exactly
+        Should -Invoke Write-BuildLog -Times 1 -Exactly -ParameterFilter { $Text -like 'WIM final cache HIT*' }
+    }
+    It 'customizes a runtime-only change from the base without reinstalling packages or drivers' {
+        Invoke-WinPEImageBuild @script:BuildArgs
+        $baseHash = (Get-FileHash -LiteralPath $script:Plan.BasePath).Hash
+        $script:BuildArgs.CachePlan = Get-WinPECachePlan -CacheDirectory $cache -BaseParts @('adk', (Get-ContentTreeHash $script:BootDrivers)) -RuntimeParts @('runtime-b')
+        Invoke-WinPEImageBuild @script:BuildArgs
+        Should -Invoke Invoke-Tool -Times 3 -Exactly -ParameterFilter { $ArgumentList -contains '/Mount-Image' }
+        Should -Invoke Invoke-Tool -Times 3 -Exactly -ParameterFilter { $ArgumentList -contains '/Add-Package' }
+        Should -Invoke Invoke-Tool -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains '/Add-Driver' }
+        Should -Invoke Sync-RuntimePayload -Times 2 -Exactly
+        (Get-FileHash -LiteralPath $script:Plan.BasePath).Hash | Should -Be $baseHash
+    }
+    It 'services both layers again after a boot driver content change' {
+        Invoke-WinPEImageBuild @script:BuildArgs
+        [IO.File]::WriteAllText((Join-Path $script:BootDrivers 'boot.inf'), 'driver-b')
+        $script:BuildArgs.CachePlan = Get-WinPECachePlan -CacheDirectory $cache -BaseParts @('adk', (Get-ContentTreeHash $script:BootDrivers)) -RuntimeParts @('runtime-a')
+        Invoke-WinPEImageBuild @script:BuildArgs
+        Should -Invoke Invoke-Tool -Times 4 -Exactly -ParameterFilter { $ArgumentList -contains '/Mount-Image' }
+        Should -Invoke Invoke-Tool -Times 6 -Exactly -ParameterFilter { $ArgumentList -contains '/Add-Package' }
+        Should -Invoke Invoke-Tool -Times 2 -Exactly -ParameterFilter { $ArgumentList -contains '/Add-Driver' }
+    }
+    It 'bypasses both cache reads and publications with NoCache' {
+        Invoke-WinPEImageBuild @script:BuildArgs
+        Mock Test-WinPECacheImage { throw 'NoCache must not read either cache.' }
+        Mock Publish-WinPECacheImage { throw 'NoCache must not publish either cache.' }
+        Invoke-WinPEImageBuild @script:BuildArgs -NoCache
+        Should -Invoke Test-WinPECacheImage -Times 0
+        Should -Invoke Publish-WinPECacheImage -Times 0
+        Should -Invoke Invoke-Tool -Times 3 -Exactly -ParameterFilter { $ArgumentList -contains '/Mount-Image' }
+        Should -Invoke Invoke-Tool -Times 6 -Exactly -ParameterFilter { $ArgumentList -contains '/Add-Package' }
+    }
+    It 'treats a <Damage> final cache as a miss but still uses the verified base' -ForEach @(
+        @{ Damage = 'corrupt image' }, @{ Damage = 'malformed receipt' }, @{ Damage = 'missing receipt' }
+    ) {
+        Invoke-WinPEImageBuild @script:BuildArgs
+        switch ($Damage) {
+            'corrupt image' {
+                $bytes = [IO.File]::ReadAllBytes($script:Plan.FinalPath)
+                $stamp = (Get-Item -LiteralPath $script:Plan.FinalPath).LastWriteTimeUtc
+                $bytes[0] = $bytes[0] -bxor 1
+                [IO.File]::WriteAllBytes($script:Plan.FinalPath, $bytes)
+                (Get-Item -LiteralPath $script:Plan.FinalPath).LastWriteTimeUtc = $stamp
+            }
+            'malformed receipt' { [IO.File]::WriteAllText("$($script:Plan.FinalPath).hash", 'not-a-hash') }
+            'missing receipt' { Remove-Item -LiteralPath "$($script:Plan.FinalPath).hash" }
+        }
+        Invoke-WinPEImageBuild @script:BuildArgs
+        Should -Invoke Invoke-Tool -Times 3 -Exactly -ParameterFilter { $ArgumentList -contains '/Mount-Image' }
+        Should -Invoke Invoke-Tool -Times 3 -Exactly -ParameterFilter { $ArgumentList -contains '/Add-Package' }
+        Test-WinPECacheImage $script:Plan.FinalPath | Should -BeTrue
+    }
+    It 'rebuilds a corrupt serviced base rather than customizing damaged data' {
+        Invoke-WinPEImageBuild @script:BuildArgs
+        Remove-Item -LiteralPath $script:Plan.FinalPath
+        [IO.File]::WriteAllText($script:Plan.BasePath, 'corrupt base')
+        Invoke-WinPEImageBuild @script:BuildArgs
+        Should -Invoke Invoke-Tool -Times 4 -Exactly -ParameterFilter { $ArgumentList -contains '/Mount-Image' }
+        Should -Invoke Invoke-Tool -Times 6 -Exactly -ParameterFilter { $ArgumentList -contains '/Add-Package' }
+        Test-WinPECacheImage $script:Plan.BasePath | Should -BeTrue
+    }
+    It 'does not mutate the base or publish a final image when customization fails' {
+        Invoke-WinPEImageBuild @script:BuildArgs
+        $baseHash = (Get-FileHash -LiteralPath $script:Plan.BasePath).Hash
+        $script:BuildArgs.CachePlan = Get-WinPECachePlan -CacheDirectory $cache -BaseParts @('adk', (Get-ContentTreeHash $script:BootDrivers)) -RuntimeParts @('runtime-b')
+        Mock Sync-RuntimePayload {
+            [IO.File]::AppendAllText($script:WorkingWim, '|failed')
+            throw 'customization failed'
+        }
+        { Invoke-WinPEImageBuild @script:BuildArgs } | Should -Throw '*customization failed*'
+        (Get-FileHash -LiteralPath $script:Plan.BasePath).Hash | Should -Be $baseHash
+        Test-Path -LiteralPath $script:BuildArgs.CachePlan.FinalPath | Should -BeFalse
+        Should -Invoke Invoke-Tool -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains '/Discard' -and $ArgumentList -contains "/MountDir:$script:ImageMount" }
+    }
+    It 'discards a failed cold service without publishing either layer' {
+        Mock Invoke-Tool { throw 'package failed' } -ParameterFilter { $ArgumentList -contains '/Add-Package' }
+        { Invoke-WinPEImageBuild @script:BuildArgs } | Should -Throw '*package failed*'
+        Test-Path -LiteralPath $script:Plan.BasePath | Should -BeFalse
+        Test-Path -LiteralPath $script:Plan.FinalPath | Should -BeFalse
+        Should -Invoke Invoke-Tool -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains '/Discard' }
+    }
+    It 'cleans an exact owned registration left behind by a failed mount command' {
+        Mock Invoke-Tool {
+            $script:ImageMounted = $true
+            throw 'mount partially failed'
+        } -ParameterFilter { $ArgumentList -contains '/Mount-Image' }
+        { Invoke-WinPEImageBuild @script:BuildArgs } | Should -Throw '*mount partially failed*'
+        Should -Invoke Invoke-Tool -Times 1 -Exactly -ParameterFilter {
+            $ArgumentList -contains '/Discard' -and $ArgumentList -contains "/MountDir:$script:ImageMount"
+        }
+        Test-Path -LiteralPath $script:Plan.BasePath | Should -BeFalse
+        Test-Path -LiteralPath $script:Plan.FinalPath | Should -BeFalse
+    }
+    It 'refuses publishing an image still registered as mounted' {
+        [IO.File]::WriteAllText($script:WorkingWim, 'mounted')
+        $script:ImageMounted = $true
+        { Publish-WinPECacheImage -Source $script:WorkingWim -Destination $script:Plan.BasePath } | Should -Throw '*mounted image*'
+        Test-Path -LiteralPath $script:Plan.BasePath | Should -BeFalse
+    }
+    It 'cleans only staged publication files when a cache copy fails' {
+        [IO.File]::WriteAllText($script:WorkingWim, 'completed image')
+        Mock Copy-Item {
+            [IO.File]::WriteAllText($Destination, 'partial')
+            throw 'cache copy failed'
+        }
+        { Publish-WinPECacheImage -Source $script:WorkingWim -Destination $script:Plan.BasePath } | Should -Throw '*cache copy failed*'
+        Test-Path -LiteralPath $script:Plan.BasePath | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $cache -File).Count | Should -Be 0
     }
 }
 
@@ -546,13 +796,18 @@ Describe 'Optional WinPE display mode' {
 
 Describe 'Build orchestration regression guards' {
     It 'injects boot drivers for ISO and USB, not just USB' {
-        $assignment = $script:BuilderAst.FindAll({
+        $calls = $script:BuilderAst.FindAll({
             param($node)
-            $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-            $node.Left.Extent.Text -eq '$injectWinpeDrivers'
+            $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq 'Invoke-WinPEImageBuild'
         }, $true)
-        $assignment.Count | Should -Be 1
-        $assignment[0].Right.Extent.Text | Should -Be '$true'
+        $calls.Count | Should -Be 1
+        $calls[0].Extent.Text | Should -Match '-DriverPath \$winpeDrivers'
+        $parent = $calls[0].Parent
+        while ($parent -and $parent -ne $script:BuilderAst) {
+            $parent | Should -Not -BeOfType ([System.Management.Automation.Language.IfStatementAst])
+            $parent = $parent.Parent
+        }
     }
     It 'does not contain global mount cleanup, registry deletion or service restarts' {
         $source = $script:BuilderAst.Extent.Text
@@ -565,5 +820,77 @@ Describe 'Build orchestration regression guards' {
             $node.Left.Extent.Text -eq '$WorkDir'
         }, $true)
         ($assignment.Right.Extent.Text -join "`n") | Should -Match 'AutoReset-Build-.*NewGuid'
+    }
+    It 'keeps the required runtime packages and drops only the unused DISM PowerShell package' {
+        $packages = $script:BuilderAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq '$packages'
+        }, $true)
+        foreach ($package in @('WinPE-WMI', 'WinPE-NetFx', 'WinPE-Scripting', 'WinPE-PowerShell', 'WinPE-StorageWMI')) {
+            $packages[0].Right.Extent.Text | Should -Match ([regex]::Escape($package))
+        }
+        $packages[0].Right.Extent.Text | Should -Not -Match 'WinPE-DismCmdlets'
+        (Get-Command Clear-StaleMounts).Definition | Should -Match 'Get-WindowsImage -Mounted'
+    }
+    It 'keeps the base recipe independent of runtime sources and the whole-builder hash' {
+        $parts = $script:BuilderAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq '$baseParts'
+        }, $true)
+        $recipe = $parts.Right.Extent.Text -join "`n"
+        $recipe | Should -Match 'Invoke-WinPEBaseServicing'
+        $recipe | Should -Match 'Get-ContentTreeHash -Path \$winpeDrivers'
+        $recipe | Should -Not -Match 'MyInvocation|runtime|Copy-|Sync-|WinPEResolution'
+    }
+    It 'does not route USB file refreshes through unconditional robocopy writes' {
+        $calls = $script:BuilderAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq 'Invoke-Robocopy'
+        }, $true)
+        ($calls.Extent.Text -join "`n") | Should -Not -Match '\$bootDrive|\$payloadDrive|\$mediaImages|\$mediaDrivers'
+        $syncs = $script:BuilderAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq 'Sync-BuildFiles'
+        }, $true)
+        @($syncs | Where-Object { $_.Extent.Text -match '-Files \$bootFiles -Destination \$bootDrive' }).Count | Should -Be 2
+        foreach ($sync in ($syncs | Where-Object { $_.Extent.Text -match '\$bootDrive' })) {
+            $sync.Extent.Text | Should -Not -Match '-Mirror'
+        }
+    }
+    It 'defaults driver compression to Fast and validates supported profiles' {
+        $parameter = $script:BuilderAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'DriverCompression' }
+        $parameter.DefaultValue.SafeGetValue() | Should -Be 'Fast'
+        $parameter.Extent.Text | Should -Match "ValidateSet\('Fast', 'Balanced', 'Maximum'\)"
+    }
+    It 'stops output timing after every output branch without detaching an else clause' {
+        $commands = $script:BuilderAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst]
+        }, $true)
+        @($commands | Where-Object { $_.GetCommandName() -eq 'else' }).Count | Should -Be 0
+        $stops = @($commands | Where-Object { $_.Extent.Text -eq "Stop-BuildPhase 'output'" })
+        $stops.Count | Should -Be 1
+        $parent = $stops[0].Parent
+        while ($parent -and $parent -ne $script:BuilderAst) {
+            $parent | Should -Not -BeOfType ([System.Management.Automation.Language.IfStatementAst])
+            $parent = $parent.Parent
+        }
+    }
+}
+
+Describe 'Build timing output' {
+    BeforeEach {
+        $script:BuildPhases = @{}
+        Mock Write-BuildLog { }
+    }
+    It 'logs phase elapsed time without contaminating function pipeline results' {
+        @(Start-BuildPhase 'copy').Count | Should -Be 0
+        @(Stop-BuildPhase 'copy').Count | Should -Be 0
+        Should -Invoke Write-BuildLog -Times 1 -Exactly -ParameterFilter { $Text -like 'Timing copy:*s' }
+        $script:BuildPhases.Count | Should -Be 0
     }
 }
