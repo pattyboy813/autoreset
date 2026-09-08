@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Builds a stripped-down, auto-running Respawn and KillDisk WinPE USB or ISO.
+    Builds a stripped-down, auto-running AutoReset and KillDisk WinPE USB or ISO.
 
 .DESCRIPTION
     Run from an elevated PowerShell prompt. Requires the Windows ADK
@@ -11,9 +11,6 @@
     AutoReset.Common.ps1 and AutoReset.UI.ps1 next to this builder. These explicit
     files are bundled into boot.wim at Payload\Scripts and mirrored to the
     deployment media's Payload\Scripts; Payload\Scripts is not a source folder.
-    Respawn is the deployment application's display name; existing AutoReset
-    script names, storage paths, ISO name/label and media ownership marker remain
-    unchanged so existing build commands and USB refreshes continue to work.
     Bundled runtime scripts use UTF-8 with a BOM for Windows PowerShell 5.1.
     Supply configuration at Payload\Config\reset.json. Optional assets live in
     Payload\Images, Payload\Drivers and Payload\Tools. OutputRoot\Images\install.wim
@@ -775,7 +772,7 @@ function Assert-UsbPayloadOwnership {
     $marker = Join-Path $root 'UNE-Payload.tag'
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf) -or
         (Get-Content -LiteralPath $marker -Raw -ErrorAction Stop).Trim() -ne 'AutoReset deployment media') {
-        throw 'PAYLOAD is not a recognized Respawn payload; refusing a destructive mirror. Build fresh media instead.'
+        throw 'PAYLOAD is not a recognized AutoReset payload; refusing a destructive mirror. Build fresh media instead.'
     }
 }
 
@@ -1307,7 +1304,7 @@ function Show-Header {
     Clear-Host
     $divider = [string]::new([char]0x2500, 50)
     Write-Host ''
-    Write-Host "  Respawn + KillDisk Build  v$($script:Version)" -ForegroundColor Cyan
+    Write-Host "  AutoReset + KillDisk Build  v$($script:Version)" -ForegroundColor Cyan
     Write-Host "  $divider" -ForegroundColor DarkGray
     if ($Mode) {
         Write-Host "  Mode: $Mode" -ForegroundColor DarkGray
@@ -1609,7 +1606,7 @@ if ($PSCmdlet.ParameterSetName -ne 'ValidateUsb') {
     Initialize-OutputRoot
     $script:BuildLog = Join-Path $artifactRoot 'build.log'
     Assert-NoReparsePath -Path $script:BuildLog
-    Set-Content -LiteralPath $script:BuildLog -Value "Respawn + KillDisk build - $(Get-Date)" -ErrorAction Stop
+    Set-Content -LiteralPath $script:BuildLog -Value "AutoReset + KillDisk build - $(Get-Date)" -ErrorAction Stop
     Write-BuildLog "Version: $($script:Version)`nScriptRoot: $ScriptRoot`nWorkDir: $WorkDir`nNoCache: $NoCache`nSkipPayload: $SkipPayload`nDriverCompression: $DriverCompression"
 }
 

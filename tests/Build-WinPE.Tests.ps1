@@ -185,7 +185,7 @@ Describe 'Destructive USB mirror ownership' {
     }
     It 'refuses a label-only disk without the builder marker' {
         Mock Test-Path { $false }
-        { Assert-UsbPayloadOwnership -Volume $script:Volume } | Should -Throw '*not a recognized Respawn payload*'
+        { Assert-UsbPayloadOwnership -Volume $script:Volume } | Should -Throw '*not a recognized AutoReset payload*'
     }
     It 'refuses an unrelated payload marker' {
         Mock Test-Path { $true }

@@ -86,28 +86,28 @@ Describe 'Deployment structure and shared UI integration' {
     }
 }
 
-Describe 'Respawn display branding' {
-    It 'uses the requested main window title' {
-        Title | Should -Be "Respawn $([char]0x2014) Windows Deployment"
-        Title -Suffix '' | Should -Be "Respawn $([char]0x2014) Windows Deployment"
+Describe 'AutoReset display branding' {
+    It 'uses only AutoReset for the main window title without a deployment subtitle' {
+        Title | Should -Be 'AutoReset'
+        Title -Suffix '' | Should -Be 'AutoReset'
     }
-    It 'keeps stage captions under the Respawn window title' -ForEach @(
+    It 'keeps stage captions under the AutoReset window title' -ForEach @(
         @{ Suffix = 'Preparing...' }, @{ Suffix = 'Disk Selection' },
         @{ Suffix = 'Complete!' }, @{ Suffix = 'Error' }
     ) {
-        Title -Suffix $Suffix | Should -Be "Respawn $([char]0x2014) Windows Deployment | $Suffix"
+        Title -Suffix $Suffix | Should -Be "AutoReset | $Suffix"
     }
-    It 'uses Respawn in prompts, failures and completion messages' {
+    It 'uses AutoReset in prompts, failures and completion messages' {
         foreach ($message in @(
-            'Preparing Respawn and gathering info...',
-            'Respawn has found the following disk to re-install Windows to:',
-            'Respawn media not found.', 'Respawn stopped.', 'Respawn error',
-            'Respawn has encountered an error', 'Respawn completed successfully',
-            'Respawn FAILED'
+            'Preparing AutoReset and gathering info...',
+            'AutoReset has found the following disk to re-install Windows to:',
+            'AutoReset media not found.', 'AutoReset stopped.', 'AutoReset error',
+            'AutoReset has encountered an error', 'AutoReset completed successfully',
+            'AutoReset FAILED'
         )) {
             $script:DeploymentSource | Should -Match ([regex]::Escape($message))
         }
-        $script:DeploymentSource | Should -Not -Match 'AutoReset (v|stopped|error|media not found|has found|has encountered|completed|FAILED)|Preparing AutoReset'
+        $script:DeploymentSource | Should -Not -Match 'Respawn|Windows Deployment'
     }
     It 'retains legacy log and recovery paths for support compatibility' {
         foreach ($path in @('AutoReset.log', 'AutoReset-Detail.log', 'AutoReset-EnableWinRE.ps1', 'AutoReset-WinRE.log')) {
@@ -750,7 +750,7 @@ Describe 'Target BCD and UEFI verification' {
         $bootStep = $script:DeploymentSteps | Where-Object Name -eq 'Create Boot Data'
         & $bootStep.Action
         Should -Invoke Invoke-CheckedTool -Times 1 -ParameterFilter {
-            $FilePath -eq 'bcdedit.exe' -and $Arguments -eq '/copy {bootmgr} /d "Windows Boot Manager - Respawn"'
+            $FilePath -eq 'bcdedit.exe' -and $Arguments -eq '/copy {bootmgr} /d "Windows Boot Manager - AutoReset"'
         }
         Should -Invoke Invoke-CheckedTool -Times 1 -ParameterFilter { $Arguments -match '^/set \{.*\} device partition=S:$' }
         Should -Invoke Invoke-CheckedTool -Times 1 -ParameterFilter { $Arguments -match '^/set \{.*\} path \\EFI\\Microsoft\\Boot\\bootmgfw.efi$' }
