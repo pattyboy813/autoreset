@@ -1,0 +1,11 @@
+{
+  "ConfirmBeforeWipe": true,
+  "TargetDiskNumber": null,
+  "ImageFile": "Images\\install.wim",
+  "ImageIndex": null,
+  "ImageEdition": "Windows 11 Pro",
+  "ContinueOnDriverError": false,
+  "DriversRequired": false,
+  "SetupRecovery": true,
+  "DriverMap": []
+}

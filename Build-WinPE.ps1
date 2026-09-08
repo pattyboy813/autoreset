@@ -1,11 +1,46 @@
-<#
+﻿<#
 .SYNOPSIS
-    Builds a stripped-down, auto-running WinPE reset USB or ISO.
+    Builds a stripped-down, auto-running AutoReset and KillDisk WinPE USB or ISO.
 
 .DESCRIPTION
     Run from an elevated PowerShell prompt. Requires the Windows ADK
     Deployment Tools and WinPE add-on. Use -InstallPrerequisites to install
     missing components.
+
+    The canonical runtime sources are Invoke-AutoReset.ps1, Invoke-KillDisk.ps1,
+    AutoReset.Common.ps1 and AutoReset.UI.ps1 next to this builder. These explicit
+    files are bundled into boot.wim at Payload\Scripts and mirrored to the
+    deployment media's Payload\Scripts; Payload\Scripts is not a source folder.
+    Bundled runtime scripts use UTF-8 with a BOM for Windows PowerShell 5.1.
+    Supply configuration at Payload\Config\reset.json. Optional assets live in
+    Payload\Images, Payload\Drivers and Payload\Tools. OutputRoot\Images\install.wim
+    takes precedence over Payload\Images\install.wim. An image is required unless
+    -SkipPayload is explicit. WinPEDrivers is injected for both USB and ISO builds.
+    The default configuration selects Windows 11 Pro by exact edition
+    name, matching the default -PrepareImage edition. ImageIndex defaults to
+    null so multi-index media is supported. If you pin an ImageIndex, it must
+    match ImageEdition; update the configuration for other editions. DriversRequired
+    defaults to false. SetupRecovery installs a first-boot WinRE registration
+    and verification hook and refuses an existing Panther answer file. For
+    custom answer files, integrate equivalent WinRE initialization/verification
+    yourself and set SetupRecovery=false to preserve your answer files.
+
+    Driver archives use ZIP unless Payload\Tools\7za.exe is a compatible,
+    standalone AMD64 extractor. A supplied incompatible extractor is an error.
+    The trusted ADK AMD64 bootsect.exe is bundled in WinPE Windows\System32
+    (on PATH) and Payload\Tools for legacy BIOS deployment.
+    Content-verified caches separate the serviced WinPE base from runtime
+    customization. Identical warm builds skip mounting; script/config/tool changes
+    customize the cached base without reinstalling packages or boot drivers.
+    Cold builds commit and remount the base once, so may take longer than before.
+    USB payload images and driver archives copy directly from their original
+    locations, not through the workspace. ISO builds still materialize these files.
+    Unchanged USB files are SHA256-checked and skipped, not blindly rewritten.
+    WorkDir is a parent for a unique, builder-owned workspace; existing folders
+    and unrelated DISM mounts are never cleaned up. Failed workspaces are retained.
+    USB updates require exactly one PE (FAT32) and PAYLOAD (NTFS) volume on the
+    same eligible physical USB disk and the builder's Payload\UNE-Payload.tag
+    ownership marker. Logs are preserved during payload refresh.
 
 .PARAMETER OutputRoot
     Folder for build files, caches, logs, and the default ISO.
@@ -15,13 +50,19 @@
     USB disk number to erase and build. Check it with Get-Disk first.
 
 .PARAMETER WorkDir
-    Scratch workspace. Default: <LocalAppData>\AutoReset\Work.
+    Parent for a unique scratch workspace. Default: <LocalAppData>\AutoReset\Work.
+    Use a local SSD with enough free space; avoid network and synced folders.
 
 .PARAMETER KeepWorkDir
     Keep the scratch workspace after a successful build.
 
 .PARAMETER SkipPayload
-    Build boot media only, without install.wim or drivers.
+    Omit installation images and deployment drivers. Runtime/config/tools are
+    still refreshed; a USB update removes old images/drivers, preserving Logs.
+
+.PARAMETER WinPEResolution
+    Optional WIDTHxHEIGHT display override. By default WinPE chooses its display
+    mode; no Display setting is generated.
 
 .PARAMETER InstallPrerequisites
     Install missing ADK and WinPE components from Microsoft.
@@ -36,7 +77,12 @@
     Output path for -BuildIso. Defaults to <OutputRoot>\AutoReset.iso.
 
 .PARAMETER NoCache
-    Rebuild the cached WIM from scratch.
+    Bypass both serviced-base and customized-final WIM caches (reads and writes).
+
+.PARAMETER DriverCompression
+    Fast (default) favors build time: LZMA2 level 1 or ZIP Fastest.
+    Balanced uses LZMA2 level 5; Maximum uses level 9 with a larger dictionary.
+    ZIP uses Optimal for Balanced and Maximum. Changing profiles rebuilds archives.
 
 .EXAMPLE
     .\Build-WinPE.ps1 -UpdateUsb
@@ -56,6 +102,7 @@
 .EXAMPLE
     .\Build-WinPE.ps1 -BuildIso
 #>
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Preparation and cleanup helpers consume script-scoped parameters; mode switches also select parameter sets.')]
 [CmdletBinding(DefaultParameterSetName = 'USB')]
 param(
     [Parameter(ParameterSetName = 'USB', Mandatory)]
@@ -69,7 +116,7 @@ param(
     [switch]$KeepWorkDir,
 
     [ValidatePattern('^\d{3,4}x\d{3,4}$')]
-    [string]$WinPEResolution = '1920x1200',
+    [string]$WinPEResolution,
 
     [Alias('BootOnly')]
     [switch]$SkipPayload,
@@ -83,6 +130,9 @@ param(
     [switch]$UpdateUsb,
 
     [switch]$NoCache,
+
+    [ValidateSet('Fast', 'Balanced', 'Maximum')]
+    [string]$DriverCompression = 'Fast',
 
     [Parameter(ParameterSetName = 'ISO', Mandatory)]
     [switch]$BuildIso,
@@ -132,6 +182,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:BuildStopwatch = [Diagnostics.Stopwatch]::StartNew()
+$script:BuildPhases = @{}
 
 # ── Constants ────────────────────────────────────────────────────────
 
@@ -159,9 +211,10 @@ if ($script:UseDefaultWorkDir) {
     }
     $WorkDir = [System.IO.Path]::Combine($localAppData, 'AutoReset', 'Work')
 }
-$WorkDir = [System.IO.Path]::GetFullPath($WorkDir)
-$mountRoot = [System.IO.Path]::Combine(
-    [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData), 'AutoReset', 'Mount')
+$workParent = [System.IO.Path]::GetFullPath($WorkDir)
+$WorkDir = [System.IO.Path]::Combine($workParent, ('AutoReset-Build-' + [guid]::NewGuid().ToString('N')))
+$script:OwnedWorkspace = $WorkDir
+$mountRoot = [System.IO.Path]::Combine($WorkDir, 'mount')
 $artifactRoot        = $OutputRoot
 $cacheDir            = [System.IO.Path]::Combine($artifactRoot, 'Cache')
 $preparedImagesRoot  = [System.IO.Path]::Combine($artifactRoot, 'Images')
@@ -260,6 +313,32 @@ function Write-BuildLog {
     }
 }
 
+function Start-BuildPhase {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Only starts an in-memory stopwatch.')]
+    [CmdletBinding()]
+    param([string]$Name)
+    if (-not $script:BuildPhases) { $script:BuildPhases = @{} }
+    $script:BuildPhases[$Name] = [Diagnostics.Stopwatch]::StartNew()
+}
+
+function Stop-BuildPhase {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Only stops and logs an in-memory stopwatch.')]
+    [CmdletBinding()]
+    param([string]$Name)
+    if ($script:BuildPhases -and $script:BuildPhases.ContainsKey($Name)) {
+        $timer = $script:BuildPhases[$Name]
+        $timer.Stop()
+        Write-BuildLog ("Timing {0}: {1:N2}s" -f $Name, $timer.Elapsed.TotalSeconds)
+        $script:BuildPhases.Remove($Name)
+    }
+}
+
+function Write-BuildTotal {
+    foreach ($phase in @($script:BuildPhases.Keys)) { Stop-BuildPhase $phase }
+    $script:BuildStopwatch.Stop()
+    Write-BuildLog ("Timing total (including preflight): {0:N2}s" -f $script:BuildStopwatch.Elapsed.TotalSeconds)
+}
+
 # ── Tool runner ──────────────────────────────────────────────────────
 
 function Invoke-Tool {
@@ -314,7 +393,8 @@ function Invoke-Tool {
     $exit   = $proc.ExitCode
     $output = $outBuf.ToString()
     $stdErr = ''
-    try { $stdErr = $errTask.Result } catch { }
+    try { $stdErr = $errTask.Result }
+    catch { Write-BuildLog "Could not read tool stderr: $($_.Exception.Message)" }
 
     Write-BuildLog ("### [{0}] {1} (exit {2})" -f
         (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $What, $exit)
@@ -331,7 +411,13 @@ function Invoke-Tool {
 
 function Invoke-Robocopy {
     param([string]$Source, [string]$Dest, [string[]]$Extra = @('/E'), [string]$What = 'copy')
-    $rcArgs = @($Source, $Dest) + $Extra + @('/BYTES', '/ETA', '/NJH', '/NJS', '/MT:32', '/J')
+    Assert-NoReparsePath -Path $Source -Recurse
+    Assert-NoReparsePath -Path $Dest -Recurse
+    if ($Extra -contains '/MIR' -or $Extra -contains '/PURGE') {
+        Assert-SafeMirror -Source $Source -Destination $Dest
+    }
+    # /IS /IT also replace same-size, same-timestamp files with changed contents.
+    $rcArgs = @($Source, $Dest) + $Extra + @('/IS', '/IT', '/XJ', '/R:2', '/W:2', '/BYTES', '/ETA', '/NJH', '/NJS', '/MT:32', '/J')
 
     $quotedArgs = $rcArgs | ForEach-Object {
         if ($_ -match '\s' -and $_ -notmatch '"') { "`"$_`"" } else { $_ }
@@ -379,9 +465,11 @@ function Invoke-Robocopy {
     $proc.WaitForExit()
     $exit   = $proc.ExitCode
     $output = $outBuf.ToString()
+    $stdErr = $errTask.Result
 
     Write-BuildLog ("### [{0}] robocopy {1} -> {2} (exit {3})" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Source, $Dest, $exit)
     Write-BuildLog $output
+    if ($stdErr.Trim()) { Write-BuildLog "[stderr] $($stdErr.Trim())" }
 
     if ($exit -ge 8) {
         $lines    = $output -split "[`r`n]+"
@@ -392,42 +480,698 @@ function Invoke-Robocopy {
     $global:LASTEXITCODE = 0
 }
 
-# ── 7-Zip discovery ─────────────────────────────────────────────────
+# ── Build safety and content helpers ────────────────────────────────
 
-function Find-SevenZip {
-    $cmd = Get-Command '7z' -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    $cmd = Get-Command '7z.exe' -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    foreach ($p in @(
-        "${env:ProgramFiles}\7-Zip\7z.exe",
-        "${env:ProgramFiles(x86)}\7-Zip\7z.exe")) {
-        if (Test-Path $p) { return $p }
+function Test-PathWithin {
+    param([string]$Path, [string]$Parent)
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $root = [IO.Path]::GetFullPath($Parent).TrimEnd('\', '/')
+    return $full.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
+        $full.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-NoReparsePath {
+    param([Parameter(Mandatory)][string]$Path, [switch]$Recurse)
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($current) {
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "Reparse points are not supported in build paths: $current"
+            }
+        }
+        $parent = Split-Path -Parent $current
+        if ($parent -eq $current) { break }
+        $current = $parent
     }
-    return $null
+    if ($Recurse -and (Test-Path -LiteralPath $Path -PathType Container)) {
+        foreach ($child in Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop) {
+            if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "Reparse points are not supported in build paths: $($child.FullName)"
+            }
+            if ($child.PSIsContainer) { Assert-NoReparsePath -Path $child.FullName -Recurse }
+        }
+    }
+}
+
+function Assert-SafeMirror {
+    param([string]$Source, [string]$Destination)
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) { throw "Mirror source missing: $Source" }
+    $dest = [IO.Path]::GetFullPath($Destination)
+    if ($dest.TrimEnd('\', '/') -eq [IO.Path]::GetPathRoot($dest).TrimEnd('\', '/') -or
+        (Test-PathWithin $dest $Source) -or (Test-PathWithin $Source $dest)) {
+        throw "Refusing a root or overlapping mirror: $Source -> $Destination"
+    }
+}
+
+function Get-BuildDiskIdentity {
+    param([Parameter(Mandatory)]$Disk)
+    if (-not ([string]$Disk.UniqueId).Trim() -and -not ([string]$Disk.SerialNumber).Trim()) {
+        throw "Disk $($Disk.Number) has no stable hardware identity."
+    }
+    return @($Disk.UniqueId, $Disk.SerialNumber, $Disk.BusType, $Disk.Size, $Disk.Path, $Disk.Location) -join '|'
+}
+
+function Assert-BuildDiskSafe {
+    param(
+        [Parameter(Mandatory)][int]$DiskNumber,
+        [string]$ExpectedIdentity,
+        [int[]]$ProtectedDiskNumbers = @(),
+        [switch]$AllowNonUsb
+    )
+    $disks = @(Get-Disk -Number $DiskNumber -ErrorAction Stop)
+    if ($disks.Count -ne 1) { throw "Disk $DiskNumber is ambiguous or unavailable." }
+    $disk = $disks[0]
+    if ($disk.Number -ne $DiskNumber -or $disk.IsBoot -ne $false -or $disk.IsSystem -ne $false -or
+        $disk.IsReadOnly -ne $false -or $disk.IsOffline -ne $false -or $DiskNumber -in $ProtectedDiskNumbers) {
+        throw "Disk $DiskNumber is boot/system, read-only, offline, protected, or its safety state is unknown."
+    }
+    if ($disk.BusType -ne 'USB' -and -not $AllowNonUsb) { throw "Disk $DiskNumber is not USB." }
+    $identity = Get-BuildDiskIdentity -Disk $disk
+    if ($ExpectedIdentity -and $identity -cne $ExpectedIdentity) { throw "Disk $DiskNumber identity changed; refusing writes." }
+    return $disk
+}
+
+function Get-BuildProtectedDiskNumbers {
+    param([Parameter(Mandatory)][string[]]$Paths)
+    $numbers = foreach ($path in $Paths) {
+        if (-not $path) { continue }
+        $existing = [IO.Path]::GetFullPath($path)
+        if ($existing.StartsWith('\\')) { continue } # Network shares cannot be the local USB target.
+        while (-not (Test-Path -LiteralPath $existing)) {
+            $parent = Split-Path -Parent $existing
+            if (-not $parent -or $parent -eq $existing) { throw "Cannot identify source/output disk: $path" }
+            $existing = $parent
+        }
+        $partitions = @(Get-Partition -FilePath $existing -ErrorAction Stop)
+        $diskNumbers = @($partitions.DiskNumber | Sort-Object -Unique)
+        if ($diskNumbers.Count -ne 1) { throw "Cannot unambiguously identify source/output disk: $path" }
+        [int]$diskNumbers[0]
+    }
+    return @($numbers | Sort-Object -Unique)
+}
+
+function Get-ValidatedUsbVolumes {
+    param([int[]]$ProtectedDiskNumbers = @(), [string]$ExpectedIdentity)
+    $boot = @(Get-Volume -FileSystemLabel 'PE' -ErrorAction SilentlyContinue)
+    $payload = @(Get-Volume -FileSystemLabel 'PAYLOAD' -ErrorAction SilentlyContinue)
+    if ($boot.Count -ne 1 -or $payload.Count -ne 1) {
+        throw 'Need exactly one PE and one PAYLOAD volume; missing or duplicate labels are unsafe.'
+    }
+    if ("$($boot[0].DriveLetter)" -notmatch '^[A-Za-z]$' -or
+        "$($payload[0].DriveLetter)" -notmatch '^[A-Za-z]$' -or
+        $boot[0].DriveLetter -eq $payload[0].DriveLetter -or
+        $boot[0].FileSystem -ne 'FAT32' -or $payload[0].FileSystem -ne 'NTFS') {
+        throw 'PE/PAYLOAD require distinct drive letters and FAT32/NTFS filesystems.'
+    }
+    $bootPart = @(Get-Partition -DriveLetter $boot[0].DriveLetter -ErrorAction Stop)
+    $payloadPart = @(Get-Partition -DriveLetter $payload[0].DriveLetter -ErrorAction Stop)
+    if ($bootPart.Count -ne 1 -or $payloadPart.Count -ne 1 -or
+        $bootPart[0].DiskNumber -ne $payloadPart[0].DiskNumber -or
+        $bootPart[0].PartitionNumber -eq $payloadPart[0].PartitionNumber -or
+        $bootPart[0].IsReadOnly -ne $false -or $payloadPart[0].IsReadOnly -ne $false -or
+        $bootPart[0].IsBoot -ne $false -or $payloadPart[0].IsBoot -ne $false -or
+        $bootPart[0].IsSystem -ne $false -or $payloadPart[0].IsSystem -ne $false) {
+        throw 'PE and PAYLOAD must be writable, distinct partitions on the same physical USB disk.'
+    }
+    $disk = Assert-BuildDiskSafe -DiskNumber $bootPart[0].DiskNumber `
+        -ExpectedIdentity $ExpectedIdentity -ProtectedDiskNumbers $ProtectedDiskNumbers
+    return [pscustomobject]@{ Boot = $boot[0]; Payload = $payload[0]; Disk = $disk }
+}
+
+function Get-ContentTreeHash {
+    param([Parameter(Mandatory)][string]$Path, [string[]]$Exclude = @())
+    if (-not (Test-Path -LiteralPath $Path)) { return 'absent' }
+    Assert-NoReparsePath -Path $Path -Recurse
+    $root = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $parts = foreach ($file in @(Get-ChildItem -LiteralPath $Path -Recurse -File -Force |
+            Where-Object Name -NotIn $Exclude | Sort-Object FullName)) {
+        $relative = $file.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
+        "$relative|$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($parts -join "`n"))).Replace('-', '') }
+    finally { $sha.Dispose() }
+}
+
+function Get-BuildPartsHash {
+    param([AllowEmptyCollection()][string[]]$Parts)
+    $text = ($Parts | ForEach-Object { "$($_.Length):$_" }) -join ''
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))).Replace('-', '') }
+    finally { $sha.Dispose() }
+}
+
+function Get-WinPECachePlan {
+    param(
+        [Parameter(Mandatory)][string]$CacheDirectory,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$BaseParts,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$RuntimeParts
+    )
+    $baseKey = Get-BuildPartsHash -Parts (@('winpe-base-v1') + $BaseParts)
+    $finalKey = Get-BuildPartsHash -Parts (@('winpe-final-v1', $baseKey) + $RuntimeParts)
+    [pscustomobject]@{
+        BaseKey = $baseKey; FinalKey = $finalKey
+        BasePath = Join-Path $CacheDirectory "winpe-base-$baseKey.wim"
+        FinalPath = Join-Path $CacheDirectory "winpe-final-$finalKey.wim"
+    }
+}
+
+function Test-WinPECacheImage {
+    param([string]$Path)
+    Assert-NoReparsePath -Path $Path
+    Assert-NoReparsePath -Path "$Path.hash"
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or
+            -not (Test-Path -LiteralPath "$Path.hash" -PathType Leaf)) { return $false }
+        $stored = (Get-Content -LiteralPath "$Path.hash" -Raw -ErrorAction Stop).Trim()
+        return $stored -match '^[0-9A-Fa-f]{64}$' -and
+            $stored -eq (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+    }
+    catch { Write-BuildLog "WIM cache MISS (unreadable receipt/image): $Path"; return $false }
+}
+
+function Publish-WinPECacheImage {
+    param([string]$Source, [string]$Destination)
+    Assert-NoReparsePath -Path $Source
+    Assert-NoReparsePath -Path $Destination
+    Assert-NoReparsePath -Path "$Destination.hash"
+    if (@(Get-WindowsImage -Mounted -ErrorAction Stop | Where-Object {
+        [IO.Path]::GetFullPath($_.ImagePath) -eq [IO.Path]::GetFullPath($Source)
+    }).Count) { throw 'Refusing to cache a mounted image.' }
+    $parent = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    $stage = Join-Path $parent ('winpe-publish-' + [guid]::NewGuid().ToString('N') + '.wim')
+    try {
+        Copy-Item -LiteralPath $Source -Destination $stage -ErrorAction Stop
+        Set-Content -LiteralPath "$stage.hash" -Value (Get-FileHash -LiteralPath $stage -Algorithm SHA256).Hash -Encoding Ascii
+        # A crash between renames leaves a mismatched receipt: next reuse is a miss.
+        Move-Item -LiteralPath $stage -Destination $Destination -Force -ErrorAction Stop
+        Move-Item -LiteralPath "$stage.hash" -Destination "$Destination.hash" -Force -ErrorAction Stop
+    }
+    finally {
+        foreach ($path in @($stage, "$stage.hash")) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+        }
+    }
+}
+
+function Invoke-WinPEBaseServicing {
+    param([string]$MountPath, [string[]]$PackagePaths, [string]$DriverPath, [int]$ScratchSpace = 512)
+    # Keep dependency packages and their language satellites ordered, not a directory-wide batch.
+    foreach ($package in $PackagePaths) {
+        Start-Step "Adding $(Split-Path -Leaf $package)"
+        Invoke-Tool -FilePath $script:DismPath -What "Add $(Split-Path -Leaf $package)" -ArgumentList @(
+            "/Image:$MountPath", '/Add-Package', "/PackagePath:$package")
+        Write-StepDone "Added $(Split-Path -Leaf $package)"
+    }
+    $driverInf = if (Test-Path -LiteralPath $DriverPath -PathType Container) {
+        Get-ChildItem -LiteralPath $DriverPath -Recurse -Filter *.inf -File -ErrorAction Stop | Select-Object -First 1
+    }
+    if ($driverInf) {
+        Start-Step 'Injecting WinPE boot drivers'
+        $driverArgs = @("/Image:$MountPath", '/Add-Driver', "/Driver:$DriverPath", '/Recurse')
+        try { Invoke-Tool -FilePath $script:DismPath -What 'Add WinPE drivers' -ArgumentList $driverArgs }
+        catch {
+            if ($_.Exception.Message -notmatch '(?i)0xc1420117|c1420117') { throw }
+            Invoke-Tool -FilePath $script:DismPath -What 'Remount owned boot.wim' -ArgumentList @(
+                '/Remount-Image', "/MountDir:$MountPath")
+            Invoke-Tool -FilePath $script:DismPath -What 'Add WinPE drivers (retry)' -ArgumentList $driverArgs
+        }
+        Write-StepDone 'Injected WinPE boot drivers'
+    }
+    else { Write-StepSkipped 'WinPE boot drivers (none found)' }
+    Invoke-Tool -FilePath $script:DismPath -What 'Set scratch space' -ArgumentList @(
+        "/Image:$MountPath", "/Set-ScratchSpace:$ScratchSpace")
+}
+
+function Invoke-WinPEImageBuild {
+    param($CachePlan, [string]$SourceWim, [string]$BootWim, [string]$MountPath,
+        [string[]]$PackagePaths, [string]$DriverPath, [object[]]$RuntimeFiles,
+        [string]$PayloadSource, [string]$BootsectSource, [string]$Resolution,
+        [int]$ScratchSpace = 512, [switch]$NoCache)
+    if (-not (Test-PathWithin $BootWim $script:OwnedWorkspace) -or
+        -not (Test-PathWithin $MountPath $script:OwnedWorkspace) -or
+        (Test-PathWithin $CachePlan.BasePath $script:OwnedWorkspace) -or
+        (Test-PathWithin $CachePlan.FinalPath $script:OwnedWorkspace) -or
+        [IO.Path]::GetFullPath($SourceWim) -eq [IO.Path]::GetFullPath($BootWim)) {
+        throw 'WIM servicing requires an owned working copy, separate from source and caches.'
+    }
+    Start-BuildPhase 'hash/cache verification'
+    $finalHit = -not $NoCache -and (Test-WinPECacheImage -Path $CachePlan.FinalPath)
+    $baseHit = -not $NoCache -and -not $finalHit -and (Test-WinPECacheImage -Path $CachePlan.BasePath)
+    Write-BuildLog ("WIM final cache {0}: {1}" -f $(if ($finalHit) { 'HIT' } else { 'MISS' }), $CachePlan.FinalKey)
+    if (-not $finalHit) {
+        Write-BuildLog ("WIM base cache {0}: {1}" -f $(if ($baseHit) { 'HIT' } else { 'MISS' }), $CachePlan.BaseKey)
+    }
+    if ($NoCache) { Write-BuildLog 'NoCache: bypassing both WIM cache levels (reads and writes)' }
+    Stop-BuildPhase 'hash/cache verification'
+    Start-BuildPhase 'servicing'
+    try {
+        $source = if ($finalHit) { $CachePlan.FinalPath } elseif ($baseHit) { $CachePlan.BasePath } else { $SourceWim }
+        Copy-Item -LiteralPath $source -Destination $BootWim -Force -ErrorAction Stop
+        Set-ItemProperty -LiteralPath $BootWim -Name IsReadOnly -Value $false
+        if ($finalHit) { Write-StepSkipped 'Final WIM cache HIT (no mounting or servicing)'; return }
+        $needsCleanup = $true
+        try {
+            Invoke-Tool -FilePath $script:DismPath -What 'Mount working boot.wim' -ArgumentList @(
+                '/Mount-Image', "/ImageFile:$BootWim", '/Index:1', "/MountDir:$MountPath")
+            if (-not $baseHit) {
+                Invoke-WinPEBaseServicing -MountPath $MountPath -PackagePaths $PackagePaths -DriverPath $DriverPath -ScratchSpace $ScratchSpace
+                if (-not $NoCache) {
+                    Invoke-Tool -FilePath $script:DismPath -What 'Commit serviced base' -ArgumentList @(
+                        '/Unmount-Image', "/MountDir:$MountPath", '/Commit')
+                    $needsCleanup = $false
+                    Publish-WinPECacheImage -Source $BootWim -Destination $CachePlan.BasePath
+                    $needsCleanup = $true
+                    Invoke-Tool -FilePath $script:DismPath -What 'Mount base working copy for runtime' -ArgumentList @(
+                        '/Mount-Image', "/ImageFile:$BootWim", '/Index:1', "/MountDir:$MountPath")
+                }
+            }
+            $system32 = Join-Path $MountPath 'Windows\System32'
+            Sync-RuntimePayload -Destination (Join-Path $MountPath 'Payload') -RuntimeFiles $RuntimeFiles -PayloadSource $PayloadSource `
+                -BootsectSource $BootsectSource -System32Path $system32
+            Set-WinPEStartup -System32Path $system32 -Resolution $Resolution
+            Invoke-Tool -FilePath $script:DismPath -What 'Commit customized WinPE image' -ArgumentList @(
+                '/Unmount-Image', "/MountDir:$MountPath", '/Commit')
+            $needsCleanup = $false
+        }
+        finally {
+            if ($needsCleanup) { Clear-StaleMounts -MountPath $MountPath -ImagePath $BootWim }
+        }
+        if (-not $NoCache) { Publish-WinPECacheImage -Source $BootWim -Destination $CachePlan.FinalPath }
+        Write-StepDone 'Committed customized WinPE image'
+    }
+    finally { Stop-BuildPhase 'servicing' }
+}
+
+function Assert-UsbPayloadOwnership {
+    param([Parameter(Mandatory)]$Volume)
+    $root = "$($Volume.DriveLetter):\Payload"
+    Assert-NoReparsePath -Path $root -Recurse
+    $marker = Join-Path $root 'UNE-Payload.tag'
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf) -or
+        (Get-Content -LiteralPath $marker -Raw -ErrorAction Stop).Trim() -ne 'AutoReset deployment media') {
+        throw 'PAYLOAD is not a recognized AutoReset payload; refusing a destructive mirror. Build fresh media instead.'
+    }
+}
+
+function Copy-ChangedFile {
+    param([string]$Source, [string]$Destination)
+    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash) {
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+    }
+}
+
+function Copy-RuntimeScript {
+    param([string]$Source, [string]$Destination)
+    $text = [IO.File]::ReadAllText($Source, [Text.UTF8Encoding]::new($false, $true))
+    $encoding = [Text.UTF8Encoding]::new($true, $true)
+    [byte[]]$bytes = $encoding.GetPreamble() + $encoding.GetBytes($text)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $expectedHash = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '') }
+    finally { $sha.Dispose() }
+    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -ne $expectedHash) {
+        [IO.File]::WriteAllBytes($Destination, $bytes)
+    }
+}
+
+function Get-RuntimeSourceFiles {
+    param([Parameter(Mandatory)][string]$Root)
+    foreach ($name in @('Invoke-AutoReset.ps1', 'Invoke-KillDisk.ps1', 'AutoReset.Common.ps1', 'AutoReset.UI.ps1')) {
+        $path = Join-Path $Root $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required runtime source missing: $path" }
+        Assert-NoReparsePath -Path $path
+        Get-Item -LiteralPath $path
+    }
+}
+
+function Sync-RuntimePayload {
+    param([string]$Destination, [object[]]$RuntimeFiles, [string]$PayloadSource,
+        [string]$BootsectSource, [string]$System32Path)
+    $scripts = Join-Path $Destination 'Scripts'
+    Assert-NoReparsePath -Path $Destination -Recurse
+    New-Item -ItemType Directory -Path $scripts -Force | Out-Null
+    foreach ($stale in @(Get-ChildItem -LiteralPath $scripts -Force)) {
+        if ($stale.PSIsContainer -or $stale.Name -notin $RuntimeFiles.Name) {
+            Remove-Item -LiteralPath $stale.FullName -Recurse -Force -ErrorAction Stop
+        }
+    }
+    foreach ($file in $RuntimeFiles) { Copy-RuntimeScript -Source $file.FullName -Destination (Join-Path $scripts $file.Name) }
+    foreach ($name in @('Config', 'Tools')) {
+        $source = Join-Path $PayloadSource $name
+        $dest = Join-Path $Destination $name
+        if (Test-Path -LiteralPath $source -PathType Container) {
+            Invoke-Robocopy -Source $source -Dest $dest -Extra @('/MIR') -What "$name runtime sync"
+        }
+        elseif (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction Stop }
+    }
+    if ($BootsectSource) {
+        $tools = Join-Path $Destination 'Tools'
+        New-Item -ItemType Directory -Path $tools -Force | Out-Null
+        Copy-ChangedFile -Source $BootsectSource -Destination (Join-Path $tools 'bootsect.exe')
+        if ($System32Path) {
+            Assert-NoReparsePath -Path $System32Path
+            if (-not (Test-Path -LiteralPath $System32Path -PathType Container)) {
+                throw "WinPE System32 directory missing: $System32Path"
+            }
+            Copy-ChangedFile -Source $BootsectSource -Destination (Join-Path $System32Path 'bootsect.exe')
+        }
+    }
+}
+
+function Assert-BuildPayload {
+    param([string]$PayloadSource, [string]$InstallImage, [switch]$BootOnly)
+    $config = Join-Path $PayloadSource 'Config\reset.json'
+    if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { throw "Required configuration missing: $config" }
+    Assert-NoReparsePath -Path $PayloadSource -Recurse
+    $settings = Get-Content -LiteralPath $config -Raw | ConvertFrom-Json -ErrorAction Stop
+    if (-not $settings -or $settings -is [array] -or $settings -isnot [pscustomobject]) {
+        throw 'reset.json must contain a configuration object.'
+    }
+    if (-not $BootOnly -and -not (Test-Path -LiteralPath $InstallImage -PathType Leaf)) {
+        throw "Installation image missing: $InstallImage. Supply install.wim or explicitly use -SkipPayload."
+    }
+    if (-not $BootOnly) { Assert-NoReparsePath -Path $InstallImage }
+}
+
+function Get-BootPartitionSize {
+    param([object[]]$Files)
+    if (@($Files | Where-Object { $_.Length -ge 4GB }).Count) {
+        throw 'A boot file exceeds the FAT32 single-file limit (4 GiB minus one byte).'
+    }
+    $bytes = ($Files | Measure-Object -Property Length -Sum).Sum
+    $size = [long]([math]::Ceiling(([math]::Max([double]512MB, $bytes * 1.15 + 128MB)) / 1MB) * 1MB)
+    if ($size -gt 32GB) { throw 'Boot files exceed the supported 32 GiB FAT32 partition limit.' }
+    return $size
+}
+
+function Assert-UpdateCapacity {
+    param([object[]]$BootFiles, [object[]]$PayloadFiles, $BootVolume, $PayloadVolume)
+    $null = Get-BootPartitionSize -Files $BootFiles
+    foreach ($entry in @(
+        @{ Files = $BootFiles; Volume = $BootVolume; Root = "$($BootVolume.DriveLetter):\" },
+        @{ Files = $PayloadFiles; Volume = $PayloadVolume; Root = "$($PayloadVolume.DriveLetter):\Payload" })) {
+        $bytes = ($entry.Files | Measure-Object Length -Sum).Sum
+        # Only count files this build will replace, not arbitrary user files or Logs.
+        $reclaimable = 0L
+        foreach ($file in $entry.Files) {
+            $dest = Join-Path $entry.Root $file.RelativePath
+            if (Test-Path -LiteralPath $dest -PathType Leaf) { $reclaimable += (Get-Item -LiteralPath $dest).Length }
+        }
+        if ($bytes + 64MB -gt $entry.Volume.SizeRemaining + $reclaimable) {
+            throw "Insufficient space on $($entry.Volume.FileSystemLabel); repartition on a larger disk or free space."
+        }
+    }
+}
+
+function Assert-BuildPartitionMapping {
+    param([int]$DiskNumber, [int]$PartitionNumber, [char]$DriveLetter)
+    $partitions = @(Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop)
+    if ($partitions.Count -ne 1 -or $partitions[0].DiskNumber -ne $DiskNumber -or
+        $partitions[0].PartitionNumber -ne $PartitionNumber) {
+        throw "Drive $DriveLetter no longer belongs to the expected USB partition."
+    }
+}
+
+function Get-MediaFileInventory {
+    param([string]$Root, [switch]$ExcludePayload)
+    $Root = [IO.Path]::GetFullPath($Root)
+    $prefixLength = $Root.TrimEnd('\', '/').Length
+    Assert-NoReparsePath -Path $Root
+    # Exclude Payload before recursion so boot inventories never walk large payload trees.
+    foreach ($entry in Get-ChildItem -LiteralPath $Root -Force -ErrorAction Stop) {
+        if ($ExcludePayload -and $entry.Name -eq 'Payload') { continue }
+        Assert-NoReparsePath -Path $entry.FullName -Recurse
+        $files = if ($entry.PSIsContainer) {
+            Get-ChildItem -LiteralPath $entry.FullName -Recurse -File -Force -ErrorAction Stop
+        } else { $entry }
+        foreach ($file in $files) {
+            [pscustomobject]@{
+                Length = $file.Length
+                RelativePath = $file.FullName.Substring($prefixLength).TrimStart('\', '/')
+                SourcePath = $file.FullName
+            }
+        }
+    }
+}
+
+function ConvertTo-BuildRelativePath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match '^[\\/]|[:*?"<>|\x00-\x1f]') {
+        throw "Unsafe relative path in file manifest: $Path"
+    }
+    $parts = $Path -split '[\\/]'
+    foreach ($part in $parts) {
+        if (-not $part -or $part -in @('.', '..') -or $part -match '[. ]$' -or
+            $part -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') {
+            throw "Ambiguous or traversal path in file manifest: $Path"
+        }
+    }
+    return $parts -join '/'
+}
+
+function Sync-BuildFiles {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'The public manifest contract synchronizes a collection of files.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Files,
+        [Parameter(Mandatory)][string]$Destination,
+        [switch]$Mirror,
+        [string[]]$PreserveDirectories = @('Logs')
+    )
+    if ([string]::IsNullOrWhiteSpace($Destination) -or $Destination -match '(^|[\\/])\.\.?([\\/]|$)|^[A-Za-z]:($|[^\\/])') {
+        throw 'Refusing an ambiguous sync destination.'
+    }
+    $destRoot = [IO.Path]::GetFullPath($Destination)
+    if ($Mirror -and $destRoot.TrimEnd('\', '/') -eq [IO.Path]::GetPathRoot($destRoot).TrimEnd('\', '/')) {
+        throw 'Refusing to mirror a volume root.'
+    }
+    Assert-NoReparsePath -Path $destRoot -Recurse
+    if ((Test-Path -LiteralPath $destRoot) -and -not (Test-Path -LiteralPath $destRoot -PathType Container)) {
+        throw 'Sync destination must be a directory.'
+    }
+    $preserved = @('Logs') + @($PreserveDirectories) | Select-Object -Unique
+    $preserved = @($preserved | ForEach-Object { ConvertTo-BuildRelativePath $_ })
+    $names = @{}
+    $directories = @{}
+    $plan = @(
+        foreach ($file in $Files) {
+            $relative = ConvertTo-BuildRelativePath ([string]$file.RelativePath)
+            foreach ($keep in $preserved) {
+                if ($relative -eq $keep -or $relative.StartsWith("$keep/", [StringComparison]::OrdinalIgnoreCase) -or
+                    $keep.StartsWith("$relative/", [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Manifest collides with preserved directory: $relative"
+                }
+            }
+            if ($names.ContainsKey($relative)) { throw "Duplicate manifest path: $relative" }
+            $names[$relative] = $true
+            $parent = $relative
+            while ($parent.Contains('/')) {
+                $parent = $parent.Substring(0, $parent.LastIndexOf('/'))
+                $directories[$parent] = $true
+            }
+            if ([string]::IsNullOrWhiteSpace([string]$file.SourcePath)) { throw "Manifest source missing: $relative" }
+            $source = [IO.Path]::GetFullPath($file.SourcePath)
+            if (Test-PathWithin $source $destRoot) { throw "Manifest source is under destination: $source" }
+            Assert-NoReparsePath -Path $source
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Manifest source missing: $source" }
+            $sourceItem = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+            if ($null -eq $file.Length -or [long]$file.Length -ne $sourceItem.Length) {
+                throw "Manifest source length changed: $source"
+            }
+            $target = Join-Path $destRoot ($relative.Replace('/', [IO.Path]::DirectorySeparatorChar))
+            if (-not (Test-PathWithin $target $destRoot)) { throw "Manifest path escapes destination: $relative" }
+            [pscustomobject]@{ SourcePath = $source; TargetPath = $target; RelativePath = $relative; Length = $sourceItem.Length }
+        }
+    )
+    # Validate the entire plan before copying or deleting anything.
+    foreach ($relative in $names.Keys) {
+        if ($directories.ContainsKey($relative)) { throw "Manifest file/directory conflict: $relative" }
+    }
+    foreach ($entry in $plan) {
+        if (Test-Path -LiteralPath $entry.TargetPath -PathType Container) {
+            throw "Destination file/directory conflict: $($entry.RelativePath)"
+        }
+    }
+    foreach ($relative in $directories.Keys) {
+        if (Test-Path -LiteralPath (Join-Path $destRoot $relative) -PathType Leaf) {
+            throw "Destination file/directory conflict: $relative"
+        }
+    }
+    $existing = @()
+    if ($Mirror -and (Test-Path -LiteralPath $destRoot -PathType Container)) {
+        $existing = @(Get-ChildItem -LiteralPath $destRoot -Recurse -Force -ErrorAction Stop)
+    }
+    $copied = 0L; $skipped = 0L; $copiedBytes = 0L; $skippedBytes = 0L
+    foreach ($entry in $plan) {
+        $same = $false
+        if (Test-Path -LiteralPath $entry.TargetPath -PathType Leaf) {
+            $same = (Get-Item -LiteralPath $entry.TargetPath -Force -ErrorAction Stop).Length -eq $entry.Length
+            if ($same) {
+                $same = (Get-FileHash -LiteralPath $entry.SourcePath -Algorithm SHA256 -ErrorAction Stop).Hash -eq
+                    (Get-FileHash -LiteralPath $entry.TargetPath -Algorithm SHA256 -ErrorAction Stop).Hash
+            }
+        }
+        if ($same) { $skipped++; $skippedBytes += $entry.Length; continue }
+        New-Item -ItemType Directory -Path (Split-Path -Parent $entry.TargetPath) -Force | Out-Null
+        Copy-Item -LiteralPath $entry.SourcePath -Destination $entry.TargetPath -Force -ErrorAction Stop
+        $copied++; $copiedBytes += $entry.Length
+    }
+    foreach ($item in ($existing | Sort-Object { $_.FullName.Length } -Descending)) {
+        $relative = $item.FullName.Substring($destRoot.TrimEnd('\', '/').Length).TrimStart('\', '/').Replace('\', '/')
+        $keepItem = $false
+        foreach ($keep in $preserved) {
+            if ($relative -eq $keep -or $relative.StartsWith("$keep/", [StringComparison]::OrdinalIgnoreCase) -or
+                $keep.StartsWith("$relative/", [StringComparison]::OrdinalIgnoreCase)) { $keepItem = $true; break }
+        }
+        if ($keepItem) { continue }
+        if ($item.PSIsContainer) {
+            if (@(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop).Count -eq 0) {
+                Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+            }
+        }
+        elseif (-not $names.ContainsKey($relative)) {
+            Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+        }
+    }
+    Write-BuildLog "Copy $Destination : copied $copied files / $copiedBytes bytes; skipped $skipped files / $skippedBytes bytes"
+}
+
+function New-UsbLayout {
+    param([int]$DiskNumber, [string]$ExpectedIdentity, [int[]]$ProtectedDiskNumbers,
+        [long]$BootPartitionSize, [switch]$AllowNonUsb)
+    $guard = @{ DiskNumber = $DiskNumber; ExpectedIdentity = $ExpectedIdentity
+        ProtectedDiskNumbers = $ProtectedDiskNumbers; AllowNonUsb = $AllowNonUsb }
+    $disk = Assert-BuildDiskSafe @guard
+    if ($disk.Size -gt 2TB) { throw 'This BIOS/UEFI MBR layout supports disks up to 2 TiB only.' }
+    if ($disk.PartitionStyle -ne 'RAW') {
+        Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
+    }
+    $disk = Assert-BuildDiskSafe @guard
+    if ($disk.PartitionStyle -eq 'RAW') {
+        Initialize-Disk -Number $DiskNumber -PartitionStyle MBR -ErrorAction Stop | Out-Null
+    }
+    elseif ($disk.PartitionStyle -ne 'MBR') {
+        Set-Disk -Number $DiskNumber -PartitionStyle MBR -ErrorAction Stop
+    }
+    $null = Assert-BuildDiskSafe @guard
+    $boot = New-Partition -DiskNumber $DiskNumber -Size $BootPartitionSize -IsActive -AssignDriveLetter -ErrorAction Stop
+    $null = Assert-BuildDiskSafe @guard
+    Format-Volume -Partition $boot -FileSystem FAT32 -NewFileSystemLabel 'PE' -Confirm:$false -ErrorAction Stop | Out-Null
+    $null = Assert-BuildDiskSafe @guard
+    $payload = New-Partition -DiskNumber $DiskNumber -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
+    $null = Assert-BuildDiskSafe @guard
+    Format-Volume -Partition $payload -FileSystem NTFS -NewFileSystemLabel 'PAYLOAD' -Confirm:$false -ErrorAction Stop | Out-Null
+    return [pscustomobject]@{ Boot = $boot; Payload = $payload }
+}
+
+function Set-WinPEStartup {
+    param([string]$System32Path, [string]$Resolution)
+    $unattendPath = Join-Path $System32Path 'winpe-unattend.xml'
+    $wpeinitArgs = ''
+    if ($Resolution) {
+        if ($Resolution -notmatch '^\d{3,4}x\d{3,4}$') { throw 'Invalid WinPE resolution.' }
+        $resParts = $Resolution -split 'x'
+        $unattend = @"
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <Display>
+        <ColorDepth>32</ColorDepth>
+        <HorizontalResolution>$($resParts[0])</HorizontalResolution>
+        <VerticalResolution>$($resParts[1])</VerticalResolution>
+        <RefreshRate>60</RefreshRate>
+      </Display>
+    </component>
+  </settings>
+</unattend>
+"@
+        Set-Content -LiteralPath $unattendPath -Value $unattend -Encoding UTF8
+        $wpeinitArgs = ' -unattend:X:\Windows\System32\winpe-unattend.xml'
+    }
+    elseif (Test-Path -LiteralPath $unattendPath) { Remove-Item -LiteralPath $unattendPath -Force -ErrorAction Stop }
+    $shellInit = '%SYSTEMDRIVE%\Windows\System32\wpeinit.exe'
+    if ($wpeinitArgs) { $shellInit += ',' + $wpeinitArgs }
+    Set-Content -LiteralPath (Join-Path $System32Path 'winpeshl.ini') -Encoding Ascii -Value @(
+        '[LaunchApps]', $shellInit,
+        '%SYSTEMDRIVE%\Windows\System32\WindowsPowerShell\v1.0\powershell.exe, -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File X:\Payload\Scripts\Invoke-AutoReset.ps1')
+    Set-Content -LiteralPath (Join-Path $System32Path 'startnet.cmd') -Encoding Ascii -Value @(
+        '@echo off', "wpeinit$wpeinitArgs",
+        'X:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File X:\Payload\Scripts\Invoke-AutoReset.ps1')
+}
+
+function Assert-RuntimeExtractor {
+    param([Parameter(Mandatory)][string]$Path)
+    Assert-NoReparsePath -Path $Path
+    $data = [IO.File]::ReadAllBytes($Path)
+    if ($data.Length -lt 64 -or [BitConverter]::ToUInt16($data, 0) -ne 0x5A4D) { throw "Invalid runtime extractor: $Path" }
+    $pe = [BitConverter]::ToInt32($data, 60)
+    if ($pe -lt 64 -or $pe + 264 -gt $data.Length -or [BitConverter]::ToUInt32($data, $pe) -ne 0x4550 -or
+        [BitConverter]::ToUInt16($data, $pe + 4) -ne 0x8664 -or [BitConverter]::ToUInt16($data, $pe + 24) -ne 0x20B) {
+        throw '7za.exe must be a standalone AMD64 Windows executable for this WinPE image.'
+    }
+    $sectionCount = [BitConverter]::ToUInt16($data, $pe + 6)
+    $sectionStart = $pe + 24 + [BitConverter]::ToUInt16($data, $pe + 20)
+    function Get-ImageOffset([uint32]$Rva) {
+        for ($i = 0; $i -lt $sectionCount; $i++) {
+            $offset = $sectionStart + $i * 40
+            if ($offset + 40 -gt $data.Length) { throw 'Invalid extractor section table.' }
+            $address = [BitConverter]::ToUInt32($data, $offset + 12)
+            $size = [BitConverter]::ToUInt32($data, $offset + 16)
+            if ($Rva -ge $address -and $Rva - $address -lt $size) {
+                $result = [long][BitConverter]::ToUInt32($data, $offset + 20) + $Rva - $address
+                if ($result -ge $data.Length) { throw 'Invalid extractor section offset.' }
+                return [int]$result
+            }
+        }
+        throw 'Invalid extractor import address.'
+    }
+    # Reject non-inbox runtimes (for example VC redistributables installed only on the build host).
+    $inbox = @('kernel32.dll', 'kernelbase.dll', 'ntdll.dll', 'user32.dll', 'advapi32.dll', 'msvcrt.dll',
+        'ole32.dll', 'oleaut32.dll', 'shell32.dll', 'shlwapi.dll', 'gdi32.dll', 'comdlg32.dll',
+        'comctl32.dll', 'crypt32.dll', 'bcrypt.dll', 'version.dll', 'secur32.dll', 'rpcrt4.dll')
+    $importRva = [BitConverter]::ToUInt32($data, $pe + 24 + 120)
+    if (-not $importRva) { throw 'Extractor has no verifiable import table.' }
+    if ([BitConverter]::ToUInt32($data, $pe + 24 + 216)) { throw 'Delay-loaded extractor dependencies are not supported.' }
+    $import = Get-ImageOffset $importRva
+    while ($true) {
+        if ($import + 20 -gt $data.Length) { throw 'Invalid extractor import table.' }
+        $nameRva = [BitConverter]::ToUInt32($data, $import + 12)
+        if (-not $nameRva) { break }
+        $nameOffset = Get-ImageOffset $nameRva
+        $end = $nameOffset
+        while ($end -lt $data.Length -and $data[$end]) { $end++ }
+        if ($end -eq $data.Length) { throw 'Invalid extractor import name.' }
+        $name = [Text.Encoding]::ASCII.GetString($data, $nameOffset, $end - $nameOffset)
+        if ($name -notin $inbox) { throw "Extractor dependency '$name' is not guaranteed in WinPE; use standalone AMD64 7za.exe." }
+        $import += 20
+    }
+    Invoke-Tool -FilePath $Path -ArgumentList @('i') -What 'Validate WinPE runtime extractor'
+    return $Path
 }
 
 # ── Driver archive change detection ─────────────────────────────────
 
 function Get-DriverSourceHash {
-    param([Parameter(Mandatory)][string]$SourcePath)
-    $files = @(Get-ChildItem -LiteralPath $SourcePath -Recurse -File -ErrorAction Stop |
-        Where-Object { $_.Name -notin @('Drivers.zip', 'Drivers.7z', 'Drivers.7z.hash', 'Drivers.zip.hash') } |
-        Sort-Object FullName)
-    if ($files.Count -eq 0) { return $null }
-
-    $parts = [System.Text.StringBuilder]::new()
-    foreach ($f in $files) {
-        $rel = $f.FullName.Substring($SourcePath.Length).TrimStart('\')
-        [void]$parts.AppendLine("$rel|$($f.Length)|$($f.LastWriteTimeUtc.Ticks)")
+    param([Parameter(Mandatory)][string]$SourcePath, [object[]]$Files)
+    if (-not $PSBoundParameters.ContainsKey('Files')) {
+        Assert-NoReparsePath -Path $SourcePath -Recurse
+        $Files = @(Get-ChildItem -LiteralPath $SourcePath -Recurse -File -Force -ErrorAction Stop |
+            Where-Object { $_.Name -notin @('Drivers.zip', 'Drivers.7z', 'Drivers.7z.hash', 'Drivers.zip.hash') })
     }
-
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    $hash = -join ($sha.ComputeHash(
-        [System.Text.Encoding]::UTF8.GetBytes($parts.ToString())
-    ) | ForEach-Object { $_.ToString('x2') })
-    $sha.Dispose()
-    return $hash
+    if ($Files.Count -eq 0) { return $null }
+    $root = [IO.Path]::GetFullPath($SourcePath).TrimEnd('\', '/')
+    $parts = foreach ($file in ($Files | Sort-Object FullName)) {
+        $relative = $file.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
+        "$relative|$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
+    }
+    return Get-BuildPartsHash -Parts $parts
 }
 
 function Invoke-DriverArchive {
@@ -435,38 +1179,57 @@ function Invoke-DriverArchive {
         [Parameter(Mandatory)][string]$SourcePath,
         [Parameter(Mandatory)][string]$ArchiveDir,
         [string]$Label,
-        [switch]$ForceRebuild
+        [switch]$ForceRebuild,
+        [ValidateSet('Fast', 'Balanced', 'Maximum')]
+        [string]$Compression = $(if ($DriverCompression) { $DriverCompression } else { 'Fast' })
     )
     if (-not (Test-Path -LiteralPath $SourcePath -PathType Container)) { return $null }
-
-    $files = @(Get-ChildItem -LiteralPath $SourcePath -Recurse -File -ErrorAction SilentlyContinue |
+    Assert-NoReparsePath -Path $SourcePath -Recurse
+    Assert-NoReparsePath -Path $ArchiveDir -Recurse
+    $files = @(Get-ChildItem -LiteralPath $SourcePath -Recurse -File -Force -ErrorAction Stop |
         Where-Object { $_.Name -notin @('Drivers.zip', 'Drivers.7z', 'Drivers.7z.hash', 'Drivers.zip.hash') })
     if ($files.Count -eq 0) { return $null }
 
     if (-not $Label) { $Label = Split-Path -Leaf $SourcePath }
 
-    $sevenZipPath = Find-SevenZip
+    $sevenZipPath = $script:RuntimeExtractor
     $use7z        = [bool]$sevenZipPath
     $archiveExt   = if ($use7z) { '7z' } else { 'zip' }
     $archivePath  = Join-Path $ArchiveDir "Drivers.$archiveExt"
     $hashPath     = "$archivePath.hash"
+    $staleExt = if ($use7z) { 'zip' } else { '7z' }
+    foreach ($stale in @("Drivers.$staleExt", "Drivers.$staleExt.hash")) {
+        $stalePath = Join-Path $ArchiveDir $stale
+        if (Test-Path -LiteralPath $stalePath) { Remove-Item -LiteralPath $stalePath -Force -ErrorAction Stop }
+    }
 
-    $currentHash = Get-DriverSourceHash -SourcePath $SourcePath
+    $options = switch ($Compression) {
+        'Fast' { @('-m0=lzma2', '-mx=1', '-ms=on') }
+        'Balanced' { @('-m0=lzma2', '-mx=5', '-ms=on') }
+        'Maximum' { @('-m0=lzma2', '-mx=9', '-mfb=273', '-md=128m', '-ms=on') }
+    }
+    $zipLevel = if ($Compression -eq 'Fast') { 'Fastest' } else { 'Optimal' }
+    $extractorHash = if ($use7z) {
+        Assert-NoReparsePath -Path $sevenZipPath
+        (Get-FileHash -LiteralPath $sevenZipPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    } else { 'dotnet-zip' }
+    $sourceHash = Get-DriverSourceHash -SourcePath $SourcePath -Files $files
+    $currentHash = Get-BuildPartsHash -Parts @('driver-archive-v2', $sourceHash, $Compression, ($options -join ' '), $zipLevel, $extractorHash)
     if (-not $currentHash) { return $null }
 
     if (-not $ForceRebuild -and (Test-Path -LiteralPath $archivePath) -and (Test-Path -LiteralPath $hashPath)) {
-        $storedHash = (Get-Content -LiteralPath $hashPath -Raw -ErrorAction SilentlyContinue).Trim()
-        if ($storedHash -eq $currentHash) {
+        $storedHash = ''
+        try { $storedHash = (Get-Content -LiteralPath $hashPath -Raw -ErrorAction Stop).Trim() }
+        catch { Write-BuildLog "Driver cache MISS (unreadable receipt): $archivePath" }
+        $expectedHash = "$currentHash|$((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash)"
+        if ($storedHash -eq $expectedHash) {
             $sizeMB = [math]::Round((Get-Item $archivePath).Length / 1MB, 0)
             Write-StepSkipped "Drivers ($Label): archive current ($sizeMB MB, no changes)"
-            Write-BuildLog "Driver archive up to date: $archivePath (hash $currentHash)"
+            Write-BuildLog "Driver cache HIT: $archivePath (content, extractor and $Compression receipt verified)"
             return $archivePath
         }
     }
-
-    $staleExt = if ($use7z) { 'zip' } else { '7z' }
-    Remove-Item -LiteralPath (Join-Path $ArchiveDir "Drivers.$staleExt") -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $ArchiveDir "Drivers.$staleExt.hash") -Force -ErrorAction SilentlyContinue
+    Write-BuildLog "Driver cache MISS: $archivePath ($Compression)"
 
     New-Item -ItemType Directory -Path $ArchiveDir -Force | Out-Null
     New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
@@ -477,20 +1240,29 @@ function Invoke-DriverArchive {
 
     if ($use7z) {
         Start-Step "Compressing drivers ($Label): $($files.Count) files, $uncompressedMB MB (7z LZMA2)"
-        Invoke-Tool -FilePath $sevenZipPath -What "7z archive ($Label)" -ArgumentList @(
-            'a', '-t7z', '-m0=lzma2', '-mx=9', '-mfb=273', '-md=128m', '-ms=on',
-            $stagingArchive, (Join-Path $SourcePath '*'))
+        Invoke-Tool -FilePath $sevenZipPath -What "7z archive ($Label)" -ArgumentList (@(
+            'a', '-t7z') + $options + @(
+            '-xr!Drivers.7z', '-xr!Drivers.zip', '-xr!Drivers.7z.hash', '-xr!Drivers.zip.hash',
+            $stagingArchive, (Join-Path $SourcePath '*')))
+        Invoke-Tool -FilePath $sevenZipPath -ArgumentList @('t', $stagingArchive) -What 'Test new archive with runtime extractor'
     }
     else {
-        Write-Aside '7-Zip not found. Using .NET ZIP (larger output). Install 7-Zip for better compression.'
+        Write-Aside 'No compatible runtime extractor supplied. Using .NET ZIP.'
         Start-Step "Compressing drivers ($Label): $($files.Count) files, $uncompressedMB MB (ZIP deflate)"
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::CreateFromDirectory(
-            $SourcePath, $stagingArchive, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        $zip = [IO.Compression.ZipFile]::Open($stagingArchive, [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($file in $files) {
+                $relative = $file.FullName.Substring($SourcePath.TrimEnd('\', '/').Length).TrimStart('\', '/').Replace('\', '/')
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $zip, $file.FullName, $relative, [IO.Compression.CompressionLevel]$zipLevel) | Out-Null
+            }
+        }
+        finally { $zip.Dispose() }
     }
 
     Move-Item -LiteralPath $stagingArchive -Destination $archivePath -Force
-    Set-Content -LiteralPath $hashPath -Value $currentHash -Encoding UTF8
+    Set-Content -LiteralPath $hashPath -Value "$currentHash|$((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash)" -Encoding UTF8
 
     $compressedMB = [math]::Round((Get-Item $archivePath).Length / 1MB, 0)
     $ratio = if ($uncompressedMB -gt 0) { [math]::Round((1 - $compressedMB / $uncompressedMB) * 100, 0) } else { 0 }
@@ -502,9 +1274,16 @@ function Invoke-DriverArchive {
 # ── Cleanup helper ───────────────────────────────────────────────────
 
 function Complete-WorkingFolder {
-    if (-not $script:UseDefaultWorkDir -or $KeepWorkDir -or
+    if ($KeepWorkDir -or
         -not (Test-Path -LiteralPath $WorkDir)) { return }
-    try { Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction Stop }
+    if ($WorkDir -cne $script:OwnedWorkspace -or (Split-Path -Leaf $WorkDir) -notmatch '^AutoReset-Build-[0-9a-f]{32}$') {
+        throw 'Refusing cleanup of an unowned workspace.'
+    }
+    Assert-NoReparsePath -Path $WorkDir -Recurse
+    if (@(Get-WindowsImage -Mounted -ErrorAction Stop | Where-Object {
+        (Test-PathWithin $_.Path $WorkDir) -or (Test-PathWithin $_.ImagePath $WorkDir)
+    }).Count) { throw 'Workspace still contains a mounted image; retaining it.' }
+    try { Remove-Item -LiteralPath $script:OwnedWorkspace -Recurse -Force -ErrorAction Stop }
     catch { Write-Aside "Couldn't remove temp workspace: $($_.Exception.Message)" }
 }
 
@@ -525,7 +1304,7 @@ function Show-Header {
     Clear-Host
     $divider = [string]::new([char]0x2500, 50)
     Write-Host ''
-    Write-Host "  AutoReset Build  v$($script:Version)" -ForegroundColor Cyan
+    Write-Host "  AutoReset + KillDisk Build  v$($script:Version)" -ForegroundColor Cyan
     Write-Host "  $divider" -ForegroundColor DarkGray
     if ($Mode) {
         Write-Host "  Mode: $Mode" -ForegroundColor DarkGray
@@ -543,6 +1322,9 @@ function Invoke-ImagePreparation {
     New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
     if (-not $DestinationImage) { $DestinationImage = Join-Path $preparedImagesRoot 'install.wim' }
     $DestinationImage = [System.IO.Path]::GetFullPath($DestinationImage)
+    Assert-NoReparsePath -Path $SourceImage
+    Assert-NoReparsePath -Path $DestinationImage
+    if ([IO.Path]::GetFullPath($SourceImage) -eq $DestinationImage) { throw 'Source and destination image paths must differ.' }
     New-Item -ItemType Directory -Path (Split-Path -Parent $DestinationImage) -Force | Out-Null
 
     Start-Step 'Reading image indexes'
@@ -580,7 +1362,6 @@ function Invoke-ImagePreparation {
             $answer = Read-Host "Overwrite $DestinationImage? Type YES to continue"
             if ($answer -cne 'YES') { throw 'Aborted.' }
         }
-        Remove-Item -LiteralPath $DestinationImage -Force
     }
 
     $workingWim = Join-Path $WorkDir 'install-prepared.wim'
@@ -600,6 +1381,10 @@ function Invoke-ImagePreparation {
 
 function Invoke-DriverPreparation {
     $driversRoot = Join-Path $ScriptRoot 'Payload\Drivers'
+    Assert-NoReparsePath -Path $driversRoot -Recurse
+    Assert-NoReparsePath -Path $preparedDriversRoot -Recurse
+    $extractor = Join-Path $ScriptRoot 'Payload\Tools\7za.exe'
+    $script:RuntimeExtractor = if (Test-Path -LiteralPath $extractor -PathType Leaf) { Assert-RuntimeExtractor -Path $extractor }
 
     if ($NoZip) {
         Write-Host "  Using raw drivers from: $driversRoot" -ForegroundColor Green
@@ -607,6 +1392,7 @@ function Invoke-DriverPreparation {
     }
 
     if ($Device) {
+        if ($Device -in @('.', '..') -or $Device -match '[\\/:*?"<>|]') { throw 'Device must be a single model folder name.' }
         $source     = Join-Path $driversRoot $Device
         $archiveDir = Join-Path $preparedDriversRoot $Device
         if (-not (Test-Path -LiteralPath $source -PathType Container)) {
@@ -641,19 +1427,25 @@ function Invoke-DriverPreparation {
 
 function Invoke-UsbValidation {
     $lines   = [System.Collections.Generic.List[string]]::new()
-    $hasFail = $false
+    $validation = @{ HasFail = $false }
 
     function Report([string]$Text) {
         $lines.Add($Text)
         $colour = if ($Text -like 'FAIL:*') { 'Red' }
                   elseif ($Text -like 'WARN:*') { 'Yellow' }
                   else { 'Green' }
-        if ($Text -like 'FAIL:*') { $script:hasFail = $true }
+        if ($Text -like 'FAIL:*') { $validation.HasFail = $true }
         Write-Host "  $Text" -ForegroundColor $colour
     }
 
-    $boot    = Get-Volume -FileSystemLabel 'PE'      -ErrorAction SilentlyContinue
-    $payload = Get-Volume -FileSystemLabel 'PAYLOAD'  -ErrorAction SilentlyContinue
+    $boot = $null
+    $payload = $null
+    try {
+        $volumes = Get-ValidatedUsbVolumes
+        $boot = $volumes.Boot
+        $payload = $volumes.Payload
+    }
+    catch { Report "FAIL: $($_.Exception.Message)" }
 
     if (-not $boot) { Report 'FAIL: PE boot volume not found.' }
     else {
@@ -665,18 +1457,22 @@ function Invoke-UsbValidation {
         }
     }
 
-    if (-not $SkipPayload) {
+    if ($payload) {
         if (-not $payload) { Report 'FAIL: PAYLOAD volume not found.' }
         else {
             Report ("PASS: PAYLOAD found ({0}:, {1:N1} GB free)" -f $payload.DriveLetter, ($payload.SizeRemaining / 1GB))
             $payloadRoot = "$($payload.DriveLetter):\Payload"
-            foreach ($rel in @('UNE-Payload.tag', 'Config\reset.json', 'Images\install.wim')) {
+            $required = @('UNE-Payload.tag', 'Config\reset.json', 'Scripts\Invoke-AutoReset.ps1',
+                'Scripts\Invoke-KillDisk.ps1', 'Scripts\AutoReset.Common.ps1', 'Scripts\AutoReset.UI.ps1')
+            if (-not $SkipPayload) { $required += 'Images\install.wim' }
+            foreach ($rel in $required) {
                 if (Test-Path (Join-Path $payloadRoot $rel)) { Report "PASS: Payload\$rel" }
                 else { Report "FAIL: missing Payload\$rel" }
             }
 
             $hasDrivers = $false
-            foreach ($archiveName in @('Drivers.7z', 'Drivers.zip')) {
+            $archiveNames = if ($SkipPayload) { @() } else { @('Drivers.7z', 'Drivers.zip') }
+            foreach ($archiveName in $archiveNames) {
                 $allArchive = Join-Path $payloadRoot "Drivers\$archiveName"
                 if (Test-Path -LiteralPath $allArchive) {
                     $sizeMB = [math]::Round((Get-Item $allArchive).Length / 1MB, 0)
@@ -689,7 +1485,7 @@ function Invoke-UsbValidation {
                     $hasDrivers = $true; break
                 }
             }
-            if (-not $hasDrivers) {
+            if (-not $SkipPayload -and -not $hasDrivers) {
                 if (Test-Path (Join-Path $payloadRoot 'Drivers')) { Report 'PASS: raw Drivers folder present.' }
                 else { Report 'WARN: no driver package found.' }
             }
@@ -701,7 +1497,7 @@ function Invoke-UsbValidation {
         if ($parent) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
         Set-Content -LiteralPath $LogFile -Value $lines -Encoding UTF8
     }
-    if ($hasFail) { throw 'USB validation failed.' }
+    if ($validation.HasFail) { throw 'USB validation failed.' }
     Write-Host ''
     Write-Host '  USB validation passed.' -ForegroundColor Green
 }
@@ -725,15 +1521,18 @@ function Get-AdkPaths {
     $toolsDir  = Join-Path $adkRoot  'Deployment Tools\amd64'
     $bootsect  = Join-Path $toolsDir 'BCDBoot\bootsect.exe'
     $oscdimg   = Join-Path $toolsDir 'Oscdimg\oscdimg.exe'
+    $dism      = Join-Path $toolsDir 'DISM\dism.exe'
 
     if (-not (Test-Path (Join-Path $winpeRoot 'en-us\winpe.wim'))) { return $null }
     if (-not (Test-Path $bootsect)) { return $null }
+    if (-not (Test-Path $dism)) { return $null }
 
     return [pscustomobject]@{
         AdkRoot   = $adkRoot
         WinpeRoot = $winpeRoot
         Bootsect  = $bootsect
         Oscdimg   = $oscdimg
+        Dism      = $dism
     }
 }
 
@@ -753,7 +1552,8 @@ function Install-AdkPrerequisites {
     $ProgressPreference = 'SilentlyContinue'
     try {
         foreach ($inst in $installers) {
-            $dest = Join-Path $env:TEMP $inst.File
+            New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+            $dest = Join-Path $WorkDir $inst.File
             Write-Aside "Downloading $($inst.Name)..."
             Invoke-WebRequest -Uri $inst.Url -OutFile $dest -UseBasicParsing
             Write-Aside "Installing $($inst.Name) (5-15 min, no progress)..."
@@ -770,87 +1570,59 @@ function Install-AdkPrerequisites {
 # ── Stale mount cleanup ─────────────────────────────────────────────
 
 function Clear-StaleMounts {
-    $recycleBinPattern = '*$Recycle.Bin*'
-    $staleMounts = @()
-    try { $staleMounts = @(Get-WindowsImage -Mounted -ErrorAction Stop) } catch { }
-    foreach ($m in $staleMounts) {
-        $isOurs = ($m.Path -like "$WorkDir*") -or ($m.ImagePath -like "$WorkDir*") -or
-                  ($m.Path -like "$mountRoot*") -or ($m.ImagePath -like "$mountRoot*") -or
-                  ($m.ImagePath -like "$ScriptRoot*") -or
-                  ($m.Path -like $recycleBinPattern) -or ($m.ImagePath -like $recycleBinPattern)
-        if (-not $isOurs) { continue }
-
-        Write-Aside "Discarding stale mount: $($m.Path)"
-        & dism.exe /Unmount-Image "/MountDir:$($m.Path)" /Discard 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            & dism.exe /Remount-Image "/MountDir:$($m.Path)" 2>&1 | Out-Null
-            & dism.exe /Unmount-Image "/MountDir:$($m.Path)" /Discard 2>&1 | Out-Null
+    param([Parameter(Mandatory)][string]$MountPath, [Parameter(Mandatory)][string]$ImagePath)
+    if (-not (Test-PathWithin $MountPath $script:OwnedWorkspace) -or
+        -not (Test-PathWithin $ImagePath $script:OwnedWorkspace)) {
+        throw 'Refusing mount cleanup outside the current owned workspace.'
+    }
+    $mounts = @(Get-WindowsImage -Mounted -ErrorAction Stop)
+    $own = @()
+    foreach ($mount in $mounts) {
+        $overlap = (Test-PathWithin $mount.Path $script:OwnedWorkspace) -or
+            (Test-PathWithin $script:OwnedWorkspace $mount.Path) -or
+            (Test-PathWithin $mount.ImagePath $script:OwnedWorkspace)
+        if (-not $overlap) { continue }
+        if ([IO.Path]::GetFullPath($mount.Path).TrimEnd('\', '/') -ne [IO.Path]::GetFullPath($MountPath).TrimEnd('\', '/') -or
+            [IO.Path]::GetFullPath($mount.ImagePath) -ne [IO.Path]::GetFullPath($ImagePath)) {
+            throw "Unknown mount overlaps this build: $($mount.Path) -> $($mount.ImagePath). Resolve it with its owner."
+        }
+        $own += $mount
+    }
+    if ($own.Count -gt 1) { throw 'Ambiguous mount registrations; refusing cleanup.' }
+    if ($own.Count -eq 1) {
+        Invoke-Tool -FilePath $script:DismPath -What 'Discard exact owned mount' -ArgumentList @(
+            '/Unmount-Image', "/MountDir:$MountPath", '/Discard')
+        if (@(Get-WindowsImage -Mounted -ErrorAction Stop | Where-Object { $_.Path -eq $MountPath }).Count) {
+            throw "Owned mount remains registered: $MountPath. Workspace retained; no global cleanup attempted."
         }
     }
-    & dism.exe /Cleanup-Mountpoints 2>&1 | Out-Null
-
-    $remaining = @()
-    try { $remaining = @(Get-WindowsImage -Mounted -ErrorAction Stop) } catch { }
-    $blocking = @($remaining | Where-Object {
-        ($_.Path -like "$WorkDir*") -or ($_.ImagePath -like "$WorkDir*") -or
-        ($_.Path -like "$mountRoot*") -or ($_.ImagePath -like "$mountRoot*") -or
-        ($_.ImagePath -like "$ScriptRoot*") -or
-        ($_.Path -like $recycleBinPattern) -or ($_.ImagePath -like $recycleBinPattern)
-    })
-
-    if ($blocking.Count -eq 0) { return }
-
-    Write-Aside 'Stale mount survived - removing WIMMount registration...'
-    $regKey = 'HKLM:\SOFTWARE\Microsoft\WIMMount\Mounted Images'
-    if (Test-Path $regKey) {
-        foreach ($sub in @(Get-ChildItem -Path $regKey -ErrorAction SilentlyContinue)) {
-            $props = Get-ItemProperty -Path $sub.PSPath -ErrorAction SilentlyContinue
-            $mp    = [string]$props.'Mount Path'
-            $wp    = [string]$props.'WIM Path'
-            $stale = ($mp -like $recycleBinPattern) -or ($wp -like $recycleBinPattern) -or
-                     ($mp -like "$WorkDir*") -or ($wp -like "$WorkDir*") -or
-                     ($mp -like "$mountRoot*") -or ($wp -like "$mountRoot*") -or
-                     ($wp -like "$ScriptRoot*") -or
-                     (-not (Test-Path -LiteralPath $mp -ErrorAction SilentlyContinue)) -or
-                     (-not (Test-Path -LiteralPath $wp -ErrorAction SilentlyContinue))
-            if ($stale) {
-                Write-Aside "Removing registration: $mp -> $wp"
-                Remove-Item -Path $sub.PSPath -Recurse -Force
-            }
-        }
-    }
-    & dism.exe /Cleanup-Mountpoints 2>&1 | Out-Null
-
-    $remaining2 = @()
-    try { $remaining2 = @(Get-WindowsImage -Mounted -ErrorAction Stop) } catch { }
-    $stillBlocking = @($remaining2 | Where-Object {
-        ($_.Path -like "$WorkDir*") -or ($_.ImagePath -like "$WorkDir*") -or
-        ($_.Path -like "$mountRoot*") -or ($_.ImagePath -like "$mountRoot*") -or
-        ($_.ImagePath -like "$ScriptRoot*") -or
-        ($_.Path -like $recycleBinPattern) -or ($_.ImagePath -like $recycleBinPattern)
-    })
-    if ($stillBlocking.Count -gt 0) {
-        $detail = ($stillBlocking | ForEach-Object { "    Mount: $($_.Path)`n    Image: $($_.ImagePath)" }) -join "`n"
-        throw ("DISM still has a stale WIM mount blocking this build:`n$detail`n" +
-               "Try: empty the Recycle Bin, delete the old build folder, run " +
-               "'reg delete `"HKLM\SOFTWARE\Microsoft\WIMMount\Mounted Images`" /f', " +
-               "reboot, then 'dism /Cleanup-Mountpoints' and re-run.")
-    }
-    Write-Aside 'Stale mount registration cleared.'
 }
 
 # ── Dispatch prep/validate modes early ──────────────────────────────
 
-if ($PSCmdlet.ParameterSetName -ne 'ValidateUsb') { Initialize-OutputRoot }
+if ($PSCmdlet.ParameterSetName -ne 'ValidateUsb') {
+    Assert-NoReparsePath -Path $OutputRoot
+    Assert-NoReparsePath -Path $workParent
+    Initialize-OutputRoot
+    $script:BuildLog = Join-Path $artifactRoot 'build.log'
+    Assert-NoReparsePath -Path $script:BuildLog
+    Set-Content -LiteralPath $script:BuildLog -Value "AutoReset + KillDisk build - $(Get-Date)" -ErrorAction Stop
+    Write-BuildLog "Version: $($script:Version)`nScriptRoot: $ScriptRoot`nWorkDir: $WorkDir`nNoCache: $NoCache`nSkipPayload: $SkipPayload`nDriverCompression: $DriverCompression"
+}
 
 switch ($PSCmdlet.ParameterSetName) {
     'PrepareImage' {
         Show-Header 'Prepare Image'
-        Invoke-ImagePreparation; Complete-WorkingFolder; return
+        try { Invoke-ImagePreparation; Complete-WorkingFolder }
+        finally { Write-BuildTotal }
+        return
     }
     'PrepareDrivers' {
         Show-Header 'Prepare Drivers'
-        Invoke-DriverPreparation; Complete-WorkingFolder; return
+        Start-BuildPhase 'drivers'
+        try { Invoke-DriverPreparation; Complete-WorkingFolder }
+        finally { Write-BuildTotal }
+        return
     }
     'ValidateUsb' {
         Show-Header 'Validate USB'
@@ -860,6 +1632,8 @@ switch ($PSCmdlet.ParameterSetName) {
 
 # ── Preflight ────────────────────────────────────────────────────────
 
+try {
+Start-BuildPhase 'preflight'
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'This needs an elevated PowerShell prompt (DISM requires admin).'
@@ -871,6 +1645,35 @@ $modeName = switch ($PSCmdlet.ParameterSetName) {
     default     { 'Build USB' }
 }
 Show-Header $modeName
+
+$payloadSrc = Join-Path $ScriptRoot 'Payload'
+$runtimeFiles = @(Get-RuntimeSourceFiles -Root $ScriptRoot)
+$externalInstallWim = Join-Path $preparedImagesRoot 'install.wim'
+$localInstallWim = Join-Path $payloadSrc 'Images\install.wim'
+$installWim = if (Test-Path -LiteralPath $externalInstallWim -PathType Leaf) { $externalInstallWim } else { $localInstallWim }
+Assert-BuildPayload -PayloadSource $payloadSrc -InstallImage $installWim -BootOnly:$SkipPayload
+Assert-NoReparsePath -Path $cacheDir -Recurse
+Assert-NoReparsePath -Path $preparedDriversRoot -Recurse
+Assert-NoReparsePath -Path (Join-Path $ScriptRoot 'WinPEDrivers') -Recurse
+$runtimeExtractorPath = Join-Path $payloadSrc 'Tools\7za.exe'
+$script:RuntimeExtractor = if (Test-Path -LiteralPath $runtimeExtractorPath -PathType Leaf) {
+    Assert-RuntimeExtractor -Path $runtimeExtractorPath
+}
+$protectedPaths = @($ScriptRoot, $OutputRoot, $workParent, $installWim)
+$protectedDisks = @()
+if (-not $BuildIso) {
+    $protectedDisks = @(Get-BuildProtectedDiskNumbers -Paths $protectedPaths)
+    if ($UpdateUsb) {
+        $initialVolumes = Get-ValidatedUsbVolumes -ProtectedDiskNumbers $protectedDisks
+        Assert-UsbPayloadOwnership -Volume $initialVolumes.Payload
+        $targetIdentity = Get-BuildDiskIdentity -Disk $initialVolumes.Disk
+        $targetNumber = $initialVolumes.Disk.Number
+    }
+    else {
+        $initialDisk = Assert-BuildDiskSafe -DiskNumber $UsbDiskNumber -ProtectedDiskNumbers $protectedDisks -AllowNonUsb:$AllowNonUsbDisk
+        $targetIdentity = Get-BuildDiskIdentity -Disk $initialDisk
+    }
+}
 
 New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
 
@@ -897,24 +1700,28 @@ if (-not $adk) {
 $winpeRoot = $adk.WinpeRoot
 $bootsect  = $adk.Bootsect
 $oscdimg   = $adk.Oscdimg
+$script:DismPath = $adk.Dism
 Write-StepDone 'Located Windows ADK'
+if (-not $SkipPayload) {
+    Invoke-Tool -FilePath $script:DismPath -What 'Validate installation image' -ArgumentList @(
+        '/Get-WimInfo', "/WimFile:$installWim")
+}
+
+$protectedPaths += @($winpeRoot, $bootsect)
+if (-not $BuildIso) {
+    $protectedDisks = @(Get-BuildProtectedDiskNumbers -Paths $protectedPaths)
+    if ($UpdateUsb) {
+        $null = Get-ValidatedUsbVolumes -ProtectedDiskNumbers $protectedDisks -ExpectedIdentity $targetIdentity
+    }
+    else {
+        $null = Assert-BuildDiskSafe -DiskNumber $UsbDiskNumber -ExpectedIdentity $targetIdentity `
+            -ProtectedDiskNumbers $protectedDisks -AllowNonUsb:$AllowNonUsbDisk
+    }
+}
 
 if ($ScriptRoot -like '*OneDrive*') {
     Write-Aside "This folder is inside OneDrive. Work folder moved to $WorkDir to avoid sync issues."
     Write-Aside 'Consider moving the whole kit to a plain local folder like C:\AutoReset.'
-}
-
-$payloadSrc = Join-Path $ScriptRoot 'Payload'
-if (-not (Test-Path (Join-Path $payloadSrc 'Scripts\Invoke-AutoReset.ps1'))) {
-    throw "Payload\Scripts\Invoke-AutoReset.ps1 not found next to this script. Run from the repo root."
-}
-
-$externalInstallWim = Join-Path $preparedImagesRoot 'install.wim'
-$localInstallWim    = Join-Path $payloadSrc 'Images\install.wim'
-$installWim = if (Test-Path -LiteralPath $externalInstallWim) { $externalInstallWim } else { $localInstallWim }
-if (-not $SkipPayload -and -not (Test-Path $installWim)) {
-    Write-Aside "No install.wim found at $externalInstallWim"
-    Write-Aside 'Media will boot but deployment will fail until you add one.'
 }
 
 # ── Step 2: Prepare work folder ─────────────────────────────────────
@@ -923,35 +1730,17 @@ Start-Step 'Preparing work folder'
 $mountDir = Join-Path $mountRoot 'boot-wim'
 $mediaDir = Join-Path $WorkDir 'media'
 
-Clear-StaleMounts
-
-if (Test-Path $mountDir) {
-    $deleted = $false
-    for ($attempt = 1; $attempt -le 4 -and -not $deleted; $attempt++) {
-        try { Remove-Item $mountDir -Recurse -Force; $deleted = $true }
-        catch {
-            if ($attempt -eq 2) {
-                Write-Aside 'File handle blocking cleanup - restarting Windows Search...'
-                try { Restart-Service WSearch -Force -ErrorAction Stop } catch { }
-            }
-            Start-Sleep -Seconds ($attempt * 3)
-        }
-    }
-    if (-not $deleted) {
-        throw ("Couldn't delete $mountDir - something has a file handle open inside it.`n" +
-               "Try: Restart-Service WSearch -Force, or exclude $WorkDir from indexing/AV.")
-    }
-}
+Clear-StaleMounts -MountPath $mountDir -ImagePath (Join-Path $mediaDir 'sources\boot.wim')
+if (Test-Path -LiteralPath $mountDir) { throw "New workspace mount directory already exists: $mountDir" }
 New-Item -ItemType Directory -Path $mountRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $mountDir -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $mediaDir 'sources') -Force | Out-Null
-$script:BuildLog = Join-Path $artifactRoot 'build.log'
-Set-Content -Path $script:BuildLog -Value "AutoReset build - $(Get-Date)" -ErrorAction SilentlyContinue
-Write-BuildLog "Version: $($script:Version)`nScriptRoot: $ScriptRoot`nWorkDir: $WorkDir`nNoCache: $NoCache`nSkipPayload: $SkipPayload"
 Write-StepDone 'Prepared work folder'
+Stop-BuildPhase 'preflight'
 
 # ── Step 3: Sync WinPE base media ───────────────────────────────────
 
+Start-BuildPhase 'copy base media'
 Start-Step 'Syncing WinPE base media'
 Invoke-Robocopy -Source (Join-Path $winpeRoot 'Media') -Dest $mediaDir -Extra @('/E', '/XF', 'boot.wim') -What 'WinPE base media'
 Write-StepDone 'Synced WinPE base media'
@@ -971,234 +1760,100 @@ foreach ($localeRoot in @($mediaDir, (Join-Path $mediaDir 'Boot'), (Join-Path $m
         }
 }
 Write-StepDone "Removed $removedCount non-en-us language folders"
+Stop-BuildPhase 'copy base media'
 
 # ── Step 5: Build or reuse cached WIM ───────────────────────────────
 
 $bootWim = Join-Path $mediaDir 'sources\boot.wim'
+Start-BuildPhase 'hash/cache keys'
 
 $packages = @(
     'WinPE-WMI',
     'WinPE-NetFx',
     'WinPE-Scripting',
     'WinPE-PowerShell',
-    'WinPE-StorageWMI',
-    'WinPE-DismCmdlets'
+    'WinPE-StorageWMI'
 )
 
 $winpeDrivers       = Join-Path $ScriptRoot 'WinPEDrivers'
-$injectWinpeDrivers = $PSCmdlet.ParameterSetName -ne 'ISO'
 $srcWinpeWim        = Join-Path $winpeRoot 'en-us\winpe.wim'
-$srcWimInfo         = Get-Item -LiteralPath $srcWinpeWim
+$ocDir = Join-Path $winpeRoot 'WinPE_OCs'
+$packagePaths = @()
+foreach ($pkg in $packages) {
+    $cab = Join-Path $ocDir "$pkg.cab"
+    if (-not (Test-Path -LiteralPath $cab -PathType Leaf)) { throw "Required WinPE package missing: $cab" }
+    $packagePaths += $cab
+    $langCab = Join-Path $ocDir "en-us\${pkg}_en-us.cab"
+    if (Test-Path -LiteralPath $langCab -PathType Leaf) { $packagePaths += $langCab }
+}
 
-$runtimeFiles = @(
-    foreach ($runtimeSource in @((Join-Path $payloadSrc 'Scripts'), (Join-Path $payloadSrc 'Config'))) {
-        if (Test-Path -LiteralPath $runtimeSource) {
-            Get-ChildItem -LiteralPath $runtimeSource -Recurse -File -ErrorAction Stop
-        }
-    }
+$baseParts = @(
+    "src:$((Get-FileHash -LiteralPath $srcWinpeWim -Algorithm SHA256).Hash)",
+    "arch:$script:Arch", "lang:$script:Lang", 'scratch:512',
+    "recipe:$((Get-Command Invoke-WinPEBaseServicing).Definition)",
+    "wpd:$(Get-ContentTreeHash -Path $winpeDrivers)"
 )
-
-$cacheKeyParts = @(
-    "src:$($srcWimInfo.Length)|$($srcWimInfo.LastWriteTimeUtc.Ticks)",
-    "pkgs:$($packages -join ',')",
-    "res:$WinPEResolution",
-    "drv:$injectWinpeDrivers",
-    "builder:$((Get-FileHash -LiteralPath $MyInvocation.MyCommand.Path -Algorithm SHA256).Hash)"
+foreach ($cab in $packagePaths) {
+    $relativeCab = $cab.Substring($ocDir.Length).TrimStart('\', '/').Replace('\', '/')
+    $baseParts += "cab:$relativeCab|$((Get-FileHash -LiteralPath $cab -Algorithm SHA256).Hash)"
+}
+$runtimeParts = @(
+    "config:$(Get-ContentTreeHash -Path (Join-Path $payloadSrc 'Config'))",
+    "tools:$(Get-ContentTreeHash -Path (Join-Path $payloadSrc 'Tools'))",
+    "bootsect:$((Get-FileHash -LiteralPath $bootsect -Algorithm SHA256).Hash)",
+    "res:$WinPEResolution"
 )
 foreach ($rf in ($runtimeFiles | Sort-Object FullName)) {
-    $rel = $rf.FullName.Substring($payloadSrc.Length).TrimStart('\')
-    $cacheKeyParts += "$rel`:$($rf.Length)|$($rf.LastWriteTimeUtc.Ticks)"
+    $runtimeParts += "$($rf.Name):$((Get-FileHash -LiteralPath $rf.FullName -Algorithm SHA256).Hash)"
 }
-if ($injectWinpeDrivers -and (Test-Path $winpeDrivers)) {
-    Get-ChildItem -Path $winpeDrivers -Recurse -File | Sort-Object FullName | ForEach-Object {
-        $cacheKeyParts += "wpd:$($_.Name)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)"
-    }
+foreach ($helper in @('Sync-RuntimePayload', 'Copy-RuntimeScript', 'Copy-ChangedFile', 'Set-WinPEStartup', 'Invoke-Robocopy')) {
+    $runtimeParts += "helper:${helper}:$((Get-Command $helper).Definition)"
 }
-
-$sha = [System.Security.Cryptography.SHA256]::Create()
-$cacheHash = -join ($sha.ComputeHash(
-    [System.Text.Encoding]::UTF8.GetBytes($cacheKeyParts -join ';')
-) | ForEach-Object { $_.ToString('x2') })
-$sha.Dispose()
-$cachedWim = Join-Path $cacheDir "winpe-$cacheHash.wim"
-
-if (-not $NoCache -and (Test-Path -LiteralPath $cachedWim)) {
-    Start-Step 'Restoring cached WIM'
-    Copy-Item -LiteralPath $cachedWim -Destination $bootWim -Force
-    Set-ItemProperty -Path $bootWim -Name IsReadOnly -Value $false
-    Write-StepDone 'Restored cached WIM (no servicing needed)'
-}
-else {
-    Start-Step 'Building WinPE image'
-    Copy-Item -Path $srcWinpeWim -Destination $bootWim -Force
-    Set-ItemProperty -Path $bootWim -Name IsReadOnly -Value $false
-
-    Invoke-Tool -FilePath dism.exe -What 'Mount boot.wim' -ArgumentList @(
-        '/Mount-Image', "/ImageFile:$bootWim", '/Index:1', "/MountDir:$mountDir")
-    $mounted = $true
-    try {
-        $ocDir = Join-Path $winpeRoot 'WinPE_OCs'
-        $packagePaths = @()
-        foreach ($pkg in $packages) {
-            $cab     = Join-Path $ocDir "$pkg.cab"
-            $langCab = Join-Path $ocDir "en-us\${pkg}_en-us.cab"
-            $packagePaths += $cab
-            if (Test-Path $langCab) { $packagePaths += $langCab }
-        }
-        Write-StepDone 'Mounted WinPE image'
-
-        for ($i = 0; $i -lt $packagePaths.Count; $i++) {
-            $pkgPath = $packagePaths[$i]
-            $pkgName = Split-Path -Path $pkgPath -Leaf
-            Start-Step "Adding package $($i + 1)/$($packagePaths.Count): $pkgName"
-            Invoke-Tool -FilePath dism.exe -What "Add $pkgName" -ArgumentList @(
-                "/Image:$mountDir", '/Add-Package', "/PackagePath:$pkgPath")
-            Write-StepDone "Added package $($i + 1)/$($packagePaths.Count): $pkgName"
-        }
-
-        $driverInf = if ($injectWinpeDrivers -and (Test-Path $winpeDrivers)) {
-            Get-ChildItem $winpeDrivers -Recurse -Filter *.inf -File -ErrorAction SilentlyContinue | Select-Object -First 1
-        }
-        if ($driverInf) {
-            Start-Step 'Injecting WinPE boot drivers'
-            $driverArgs = @("/Image:$mountDir", '/Add-Driver', "/Driver:$winpeDrivers", '/Recurse')
-            try {
-                Invoke-Tool -FilePath dism.exe -What 'Add WinPE drivers' -ArgumentList $driverArgs
-            }
-            catch {
-                if ($_.Exception.Message -notmatch '(?i)0xc1420117|c1420117') { throw }
-                Write-Aside 'DISM lost the mount handle - remounting and retrying...'
-                & dism.exe /Remount-Image "/MountDir:$mountDir" 2>&1 | Out-Null
-                if ($LASTEXITCODE -ne 0) {
-                    throw "Couldn't remount boot.wim after driver failure."
-                }
-                Invoke-Tool -FilePath dism.exe -What 'Add WinPE drivers (retry)' -ArgumentList $driverArgs
-            }
-            Write-StepDone 'Injected WinPE boot drivers'
-        }
-        else {
-            Write-StepSkipped 'WinPE boot drivers (none found)'
-        }
-
-        Start-Step 'Setting scratch space to 512 MB'
-        Invoke-Tool -FilePath dism.exe -What 'Set scratch space' -ArgumentList @(
-            "/Image:$mountDir", '/Set-ScratchSpace:512')
-        Write-StepDone 'Set scratch space to 512 MB'
-
-        $sevenZaSource = Join-Path $ScriptRoot 'Payload\Tools\7za.exe'
-        if (Test-Path -LiteralPath $sevenZaSource) {
-            Start-Step 'Bundling 7za.exe into WinPE'
-            $wimTools = Join-Path $mountDir 'Payload\Tools'
-            New-Item -ItemType Directory -Path $wimTools -Force | Out-Null
-            Copy-Item -LiteralPath $sevenZaSource -Destination (Join-Path $wimTools '7za.exe') -Force
-            Write-StepDone 'Bundled 7za.exe into WinPE'
-        }
-        else {
-            Write-StepSkipped '7za.exe not in Payload\Tools (WinPE will only extract .zip drivers)'
-        }
-
-        $imgPayload = Join-Path $mountDir 'Payload'
-        if (-not (Test-Path $imgPayload)) { New-Item -ItemType Directory -Path $imgPayload -Force | Out-Null }
-        Copy-Item -Path (Join-Path $payloadSrc 'Scripts') -Destination $imgPayload -Recurse -Force
-        Copy-Item -Path (Join-Path $payloadSrc 'Config')  -Destination $imgPayload -Recurse -Force
-
-        $resParts = $WinPEResolution -split 'x'
-        $peUnattend = @"
-<?xml version="1.0" encoding="utf-8"?>
-<unattend xmlns="urn:schemas-microsoft-com:unattend">
-  <settings pass="windowsPE">
-    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64"
-               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <Display>
-        <ColorDepth>32</ColorDepth>
-        <HorizontalResolution>$($resParts[0])</HorizontalResolution>
-        <VerticalResolution>$($resParts[1])</VerticalResolution>
-        <RefreshRate>60</RefreshRate>
-      </Display>
-    </component>
-  </settings>
-</unattend>
-"@
-        Set-Content -Path (Join-Path $mountDir 'Windows\System32\winpe-unattend.xml') -Value $peUnattend -Encoding UTF8
-
-        $winpeshl = @'
-[LaunchApps]
-%SYSTEMDRIVE%\Windows\System32\wpeinit.exe, -unattend:%SYSTEMDRIVE%\Windows\System32\winpe-unattend.xml
-%SYSTEMDRIVE%\Windows\System32\WindowsPowerShell\v1.0\powershell.exe, -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File X:\Payload\Scripts\Invoke-AutoReset.ps1
-'@
-        Set-Content -Path (Join-Path $mountDir 'Windows\System32\winpeshl.ini') -Value $winpeshl -Encoding Ascii
-
-        $startnet = @'
-@echo off
-wpeinit -unattend:X:\Windows\System32\winpe-unattend.xml
-X:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File X:\Payload\Scripts\Invoke-AutoReset.ps1
-'@
-        Set-Content -Path (Join-Path $mountDir 'Windows\System32\startnet.cmd') -Value $startnet -Encoding Ascii
-
-        Start-Step 'Committing WinPE image'
-        Invoke-Tool -FilePath dism.exe -What 'Unmount + commit' -ArgumentList @(
-            '/Unmount-Image', "/MountDir:$mountDir", '/Commit')
-        $mounted = $false
-        Write-StepDone 'Committed WinPE image'
-    }
-    finally {
-        if ($mounted) {
-            Write-StepFailed 'Build failed - discarding mount'
-            & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                & dism.exe /Remount-Image "/MountDir:$mountDir" 2>&1 | Out-Null
-                & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard 2>&1 | Out-Null
-            }
-        }
-    }
-
-    Copy-Item -LiteralPath $bootWim -Destination $cachedWim -Force
-    Get-ChildItem -Path $cacheDir -Filter 'winpe-*.wim' |
-        Where-Object { $_.Name -ne "winpe-$cacheHash.wim" } |
-        Remove-Item -Force -ErrorAction SilentlyContinue
-    Write-BuildLog "Cached WIM: $cachedWim"
-}
+$cachePlan = Get-WinPECachePlan -CacheDirectory $cacheDir -BaseParts $baseParts -RuntimeParts $runtimeParts
+Stop-BuildPhase 'hash/cache keys'
+Invoke-WinPEImageBuild -CachePlan $cachePlan -SourceWim $srcWinpeWim -BootWim $bootWim -MountPath $mountDir `
+    -PackagePaths $packagePaths -DriverPath $winpeDrivers -RuntimeFiles $runtimeFiles -PayloadSource $payloadSrc `
+    -BootsectSource $bootsect -Resolution $WinPEResolution -ScratchSpace 512 -NoCache:$NoCache
 
 # ── Step 6: Sync payload ────────────────────────────────────────────
 
+Start-BuildPhase 'copy runtime staging'
+Start-Step 'Syncing runtime payload'
+$mediaPayload = Join-Path $mediaDir 'Payload'
+Sync-RuntimePayload -Destination $mediaPayload -RuntimeFiles $runtimeFiles -PayloadSource $payloadSrc -BootsectSource $bootsect
+Set-Content -LiteralPath (Join-Path $mediaPayload 'UNE-Payload.tag') -Value 'AutoReset deployment media' -Encoding Ascii
+Write-StepDone 'Synced runtime payload'
+Stop-BuildPhase 'copy runtime staging'
+$externalPayloadFiles = @()
+
 if (-not $SkipPayload) {
-    Start-Step 'Syncing reset payload'
-    $mediaPayload = Join-Path $mediaDir 'Payload'
-    New-Item -ItemType Directory -Path $mediaPayload -Force | Out-Null
-    Set-Content -Path (Join-Path $mediaPayload 'UNE-Payload.tag') -Value 'AutoReset deployment media' -Encoding Ascii
-
-    Invoke-Robocopy -Source (Join-Path $payloadSrc 'Config') -Dest (Join-Path $mediaPayload 'Config') `
-        -Extra @('/MIR') -What 'config sync'
-
-    if (Test-Path $installWim) {
-        $mediaImages = Join-Path $mediaPayload 'Images'
-        New-Item -ItemType Directory -Path $mediaImages -Force | Out-Null
-        $destWim = Join-Path $mediaImages 'install.wim'
-        if (-not (Test-Path $destWim) -or
-            (Get-Item $installWim).Length -ne (Get-Item $destWim -ErrorAction SilentlyContinue).Length) {
-            Copy-Item -LiteralPath $installWim -Destination $destWim -Force
+    Start-Step 'Planning direct payload copies'
+    $localImages = Join-Path $payloadSrc 'Images'
+    if (Test-Path -LiteralPath $localImages -PathType Container) {
+        foreach ($file in Get-MediaFileInventory -Root $localImages) {
+            if ($file.RelativePath -eq 'install.wim') { continue }
+            $externalPayloadFiles += [pscustomobject]@{
+                RelativePath = "Images/$($file.RelativePath)"; Length = $file.Length; SourcePath = $file.SourcePath
+            }
         }
     }
+    $externalPayloadFiles += [pscustomobject]@{
+        RelativePath = 'Images/install.wim'; Length = (Get-Item -LiteralPath $installWim).Length; SourcePath = $installWim
+    }
+    Write-StepDone 'Planned direct payload copies'
 
-    Write-StepDone 'Synced reset payload'
-
-    # Pat - Dynamic driver preparation during build --------------------
-    #-----------------------------------------------------------------------
+    Start-BuildPhase 'drivers'
     $driversSrc = Join-Path $payloadSrc 'Drivers'
     if (Test-Path -LiteralPath $driversSrc) {
-        $mediaDrivers = Join-Path $mediaPayload 'Drivers'
-
         $modelFolders = @(Get-ChildItem -LiteralPath $driversSrc -Directory -ErrorAction SilentlyContinue |
             Sort-Object Name)
 
         if ($modelFolders.Count -eq 0) {
             $archive = Invoke-DriverArchive -SourcePath $driversSrc -ArchiveDir $preparedDriversRoot -Label 'all'
             if ($archive) {
-                New-Item -ItemType Directory -Path $mediaDrivers -Force | Out-Null
-                $destArchive = Join-Path $mediaDrivers (Split-Path -Leaf $archive)
-                if (-not (Test-Path $destArchive) -or
-                    (Get-Item $archive).Length -ne (Get-Item $destArchive -ErrorAction SilentlyContinue).Length) {
-                    Copy-Item -LiteralPath $archive -Destination $destArchive -Force
+                $externalPayloadFiles += [pscustomobject]@{
+                    RelativePath = "Drivers/$(Split-Path -Leaf $archive)"
+                    Length = (Get-Item -LiteralPath $archive).Length; SourcePath = $archive
                 }
             }
             else {
@@ -1212,12 +1867,9 @@ if (-not $SkipPayload) {
                 $archive = Invoke-DriverArchive -SourcePath $modelFolder.FullName `
                     -ArchiveDir $archiveDir -Label $modelName
                 if ($archive) {
-                    $modelDest = Join-Path $mediaDrivers $modelName
-                    New-Item -ItemType Directory -Path $modelDest -Force | Out-Null
-                    $destArchive = Join-Path $modelDest (Split-Path -Leaf $archive)
-                    if (-not (Test-Path $destArchive) -or
-                        (Get-Item $archive).Length -ne (Get-Item $destArchive -ErrorAction SilentlyContinue).Length) {
-                        Copy-Item -LiteralPath $archive -Destination $destArchive -Force
+                    $externalPayloadFiles += [pscustomobject]@{
+                        RelativePath = "Drivers/$modelName/$(Split-Path -Leaf $archive)"
+                        Length = (Get-Item -LiteralPath $archive).Length; SourcePath = $archive
                     }
                 }
             }
@@ -1226,20 +1878,19 @@ if (-not $SkipPayload) {
     else {
         Write-StepSkipped 'No Payload\Drivers folder found'
     }
-
-    $sevenZaSrc = Join-Path $payloadSrc 'Tools\7za.exe'
-    if (Test-Path -LiteralPath $sevenZaSrc) {
-        $mediaTools = Join-Path $mediaPayload 'Tools'
-        New-Item -ItemType Directory -Path $mediaTools -Force | Out-Null
-        Copy-Item -LiteralPath $sevenZaSrc -Destination (Join-Path $mediaTools '7za.exe') -Force
-    }
-    # Pat - End dynamic driver preparation -----------------------------
-    #-----------------------------------------------------------------------
+    Stop-BuildPhase 'drivers'
 }
 
 # ── Step 7: Output (ISO / USB update / USB fresh) ───────────────────
 
+$bootFiles = @(Get-MediaFileInventory -Root $mediaDir -ExcludePayload)
+$payloadFiles = @(Get-MediaFileInventory -Root $mediaPayload) + $externalPayloadFiles
+Start-BuildPhase 'output'
+
 if ($PSCmdlet.ParameterSetName -eq 'ISO') {
+    Start-BuildPhase 'copy ISO payload'
+    Sync-BuildFiles -Files $externalPayloadFiles -Destination $mediaPayload
+    Stop-BuildPhase 'copy ISO payload'
     if (-not (Test-Path -LiteralPath $oscdimg)) {
         throw "oscdimg.exe not found at $oscdimg. Install the ADK Deployment Tools and retry."
     }
@@ -1256,64 +1907,72 @@ if ($PSCmdlet.ParameterSetName -eq 'ISO') {
     if ($isoDir -and -not (Test-Path -LiteralPath $isoDir -PathType Container)) {
         New-Item -ItemType Directory -Path $isoDir -Force | Out-Null
     }
-    Remove-Item -LiteralPath $IsoPath -Force -ErrorAction SilentlyContinue
+    Assert-NoReparsePath -Path $IsoPath
+    if ([IO.Path]::GetExtension($IsoPath) -ne '.iso' -or
+        (Test-PathWithin $IsoPath $WorkDir) -or (Test-PathWithin $IsoPath $payloadSrc)) {
+        throw 'ISO output must be an .iso file outside the workspace and payload source.'
+    }
+    $stagedIso = Join-Path $isoDir ('AutoReset-' + [guid]::NewGuid().ToString('N') + '.iso')
 
     $bootData = "-bootdata:2#p0,e,b`"$biosBootImage`"#pEF,e,b`"$uefiBootImage`""
     Start-Step 'Creating bootable ISO'
     Invoke-Tool -FilePath $oscdimg -What 'oscdimg' -ArgumentList @(
-        '-m', '-o', '-u2', '-udfver102', '-lAUTORESET', $bootData, $mediaDir, $IsoPath)
-    if (-not (Test-Path -LiteralPath $IsoPath)) { throw "oscdimg completed but didn't create $IsoPath" }
+        '-m', '-o', '-u2', '-udfver102', '-lAUTORESET', $bootData, $mediaDir, $stagedIso)
+    if (-not (Test-Path -LiteralPath $stagedIso)) { throw "oscdimg completed but didn't create $stagedIso" }
+    Move-Item -LiteralPath $stagedIso -Destination $IsoPath -Force -ErrorAction Stop
     Write-StepDone 'Created bootable ISO'
     Write-Host ''
     Write-Host "  ISO ready: $IsoPath" -ForegroundColor Green
 }
 elseif ($PSCmdlet.ParameterSetName -eq 'USBUPDATE') {
     Start-Step 'Refreshing existing deployment stick'
-    $bootVol    = Get-Volume -FileSystemLabel 'PE'      -ErrorAction SilentlyContinue
-    $payloadVol = Get-Volume -FileSystemLabel 'PAYLOAD' -ErrorAction SilentlyContinue
-    if (-not $bootVol -or -not $payloadVol) {
-        Write-StepFailed "Couldn't find an AutoReset USB"
-        throw "No AutoReset USB found (need volumes labelled PE and PAYLOAD). Build one first with -UsbDiskNumber."
+    $protectedDisks = @(Get-BuildProtectedDiskNumbers -Paths $protectedPaths)
+    $volumes = Get-ValidatedUsbVolumes -ProtectedDiskNumbers $protectedDisks -ExpectedIdentity $targetIdentity
+    Assert-UsbPayloadOwnership -Volume $volumes.Payload
+    if ($volumes.Disk.Number -ne $targetNumber) { throw 'USB disk number changed during the build.' }
+    $bootVol = $volumes.Boot
+    $payloadVol = $volumes.Payload
+    $bootDrive    = "$($bootVol.DriveLetter):\"
+    $payloadDrive = "$($payloadVol.DriveLetter):\"
+    Assert-NoReparsePath -Path $bootDrive -Recurse
+    Assert-NoReparsePath -Path (Join-Path $payloadDrive 'Payload') -Recurse
+    if (Test-Path -LiteralPath (Join-Path $bootDrive 'Payload')) {
+        throw 'Unexpected Payload directory on PE; refusing an ambiguous refresh. Build fresh media instead.'
     }
-    $bootDrive    = "$($bootVol.DriveLetter):"
-    $payloadDrive = "$($payloadVol.DriveLetter):"
+    Assert-UpdateCapacity -BootFiles $bootFiles -PayloadFiles $payloadFiles -BootVolume $bootVol -PayloadVolume $payloadVol
+    $currentVolumes = Get-ValidatedUsbVolumes -ProtectedDiskNumbers $protectedDisks -ExpectedIdentity $targetIdentity
+    Assert-UsbPayloadOwnership -Volume $currentVolumes.Payload
+    if ($currentVolumes.Boot.DriveLetter -ne $bootVol.DriveLetter -or
+        $currentVolumes.Payload.DriveLetter -ne $payloadVol.DriveLetter -or
+        $currentVolumes.Disk.Number -ne $targetNumber) {
+        throw 'USB partition mapping changed before the refresh.'
+    }
 
-    Invoke-Robocopy -Source $mediaDir -Dest $bootDrive -Extra @('/E', '/XD', 'Payload') -What 'boot file refresh'
-    if (-not $SkipPayload) {
-        Invoke-Robocopy -Source (Join-Path $mediaDir 'Payload') -Dest (Join-Path $payloadDrive 'Payload') `
-            -Extra @('/MIR', '/XD', 'Logs') -What 'payload refresh'
+    Start-BuildPhase 'copy USB refresh'
+    Sync-BuildFiles -Files $bootFiles -Destination $bootDrive
+    $currentVolumes = Get-ValidatedUsbVolumes -ProtectedDiskNumbers $protectedDisks -ExpectedIdentity $targetIdentity
+    Assert-UsbPayloadOwnership -Volume $currentVolumes.Payload
+    if ($currentVolumes.Boot.DriveLetter -ne $bootVol.DriveLetter -or
+        $currentVolumes.Payload.DriveLetter -ne $payloadVol.DriveLetter -or
+        $currentVolumes.Disk.Number -ne $targetNumber) {
+        throw 'USB partition mapping changed during the refresh.'
     }
+    Sync-BuildFiles -Files $payloadFiles -Destination (Join-Path $payloadDrive 'Payload') -Mirror -PreserveDirectories @('Logs')
+    Stop-BuildPhase 'copy USB refresh'
     Write-StepDone 'Refreshed existing deployment stick'
     Write-Host ''
     Write-Host '  Stick refreshed (Logs folder preserved).' -ForegroundColor Green
 }
 else {
     Start-Step 'Checking USB capacity'
-    $disk = Get-Disk -Number $UsbDiskNumber
-    if ($disk.BusType -ne 'USB' -and -not $AllowNonUsbDisk) {
-        Write-StepFailed "Disk $UsbDiskNumber isn't USB"
-        throw ("Disk $UsbDiskNumber is '$($disk.BusType)', not USB. " +
-               "Re-run with -AllowNonUsbDisk if it's a USB stick passed through to Hyper-V.")
-    }
-
-    $bootPartitionSize = 700MB
-    $bootFiles = @(Get-ChildItem -LiteralPath $mediaDir -Recurse -File |
-        Where-Object { $_.FullName -notlike "$(Join-Path $mediaDir 'Payload')\*" })
-    $bootBytes = ($bootFiles | Measure-Object -Property Length -Sum).Sum
-    $bootRoom  = $bootPartitionSize - 64MB
-    if ($bootBytes -gt $bootRoom) {
-        Write-StepFailed 'Boot media too large for 700 MB PE partition'
-        throw ("Boot media is {0:N1} MB but only {1:N1} MB fits." -f ($bootBytes / 1MB), ($bootRoom / 1MB))
-    }
-
-    $mediaSrcPayload = Join-Path $mediaDir 'Payload'
-    if (-not $SkipPayload -and (Test-Path $mediaSrcPayload)) {
-        $payloadBytes  = (Get-ChildItem -Path $mediaSrcPayload -Recurse -File | Measure-Object -Property Length -Sum).Sum
-        $payloadRoom   = $disk.Size - $bootPartitionSize - 128MB
-        if ($payloadBytes -gt $payloadRoom) {
-            Write-StepFailed 'USB stick too small for the payload'
-            throw ("Payload is {0:N2} GB but only ~{1:N2} GB fits." -f ($payloadBytes / 1GB), ($payloadRoom / 1GB))
-        }
+    $protectedDisks = @(Get-BuildProtectedDiskNumbers -Paths $protectedPaths)
+    $disk = Assert-BuildDiskSafe -DiskNumber $UsbDiskNumber -ExpectedIdentity $targetIdentity `
+        -ProtectedDiskNumbers $protectedDisks -AllowNonUsb:$AllowNonUsbDisk
+    if ($disk.Size -gt 2TB) { throw 'This BIOS/UEFI MBR layout supports disks up to 2 TiB only.' }
+    $bootPartitionSize = Get-BootPartitionSize -Files $bootFiles
+    $payloadBytes = ($payloadFiles | Measure-Object -Property Length -Sum).Sum
+    if ($payloadBytes + $bootPartitionSize + 256MB -gt $disk.Size) {
+        throw 'USB disk is too small for the dynamically sized boot partition and payload.'
     }
     Write-StepDone "Checked USB capacity: $($disk.FriendlyName) ($([math]::Round($disk.Size / 1GB, 1)) GB)"
 
@@ -1325,18 +1984,11 @@ else {
     Write-Host ''
 
     Start-Step 'Wiping and partitioning USB'
-    Clear-Disk -Number $UsbDiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction SilentlyContinue
-    if ((Get-Disk -Number $UsbDiskNumber).PartitionStyle -eq 'RAW') {
-        Initialize-Disk -Number $UsbDiskNumber -PartitionStyle MBR | Out-Null
-    }
-    elseif ((Get-Disk -Number $UsbDiskNumber).PartitionStyle -ne 'MBR') {
-        Set-Disk -Number $UsbDiskNumber -PartitionStyle MBR
-    }
-
-    $bootPart    = New-Partition -DiskNumber $UsbDiskNumber -Size 700MB -IsActive -AssignDriveLetter
-    Format-Volume -Partition $bootPart -FileSystem FAT32 -NewFileSystemLabel 'PE' -Confirm:$false | Out-Null
-    $payloadPart = New-Partition -DiskNumber $UsbDiskNumber -UseMaximumSize -AssignDriveLetter
-    Format-Volume -Partition $payloadPart -FileSystem NTFS -NewFileSystemLabel 'PAYLOAD' -Confirm:$false | Out-Null
+    $protectedDisks = @(Get-BuildProtectedDiskNumbers -Paths $protectedPaths)
+    $layout = New-UsbLayout -DiskNumber $UsbDiskNumber -ExpectedIdentity $targetIdentity `
+        -ProtectedDiskNumbers $protectedDisks -BootPartitionSize $bootPartitionSize -AllowNonUsb:$AllowNonUsbDisk
+    $bootPart = $layout.Boot
+    $payloadPart = $layout.Payload
 
     $bootLetter    = $null
     $payloadLetter = $null
@@ -1350,24 +2002,34 @@ else {
         Write-StepFailed "Windows didn't assign drive letters"
         throw "Partitioned the stick but Windows didn't assign drive letters. Unplug/replug and re-run."
     }
-    $bootDrive    = "${bootLetter}:"
-    $payloadDrive = "${payloadLetter}:"
+    $bootDrive    = "${bootLetter}:\"
+    $payloadDrive = "${payloadLetter}:\"
     Write-StepDone "Wiped and partitioned USB (PE=$bootLetter`:, PAYLOAD=$payloadLetter`:)"
 
     Start-Step "Copying boot files to $bootLetter`:"
-    Invoke-Robocopy -Source $mediaDir -Dest $bootDrive -Extra @('/E', '/XD', 'Payload', '/R:2', '/W:2') -What 'boot file copy'
+    $null = Assert-BuildDiskSafe -DiskNumber $UsbDiskNumber -ExpectedIdentity $targetIdentity `
+        -ProtectedDiskNumbers $protectedDisks -AllowNonUsb:$AllowNonUsbDisk
+    Assert-BuildPartitionMapping -DiskNumber $UsbDiskNumber -PartitionNumber $bootPart.PartitionNumber -DriveLetter $bootLetter
+    Start-BuildPhase 'copy USB boot'
+    Sync-BuildFiles -Files $bootFiles -Destination $bootDrive
+    Stop-BuildPhase 'copy USB boot'
     Write-StepDone "Copied boot files to $bootLetter`:"
 
-    if (-not $SkipPayload) {
-        Start-Step "Copying payload to $payloadLetter`: (the slow bit)"
-        Invoke-Robocopy -Source (Join-Path $mediaDir 'Payload') -Dest (Join-Path $payloadDrive 'Payload') `
-            -Extra @('/E', '/R:2', '/W:2') -What 'payload copy'
-        Write-StepDone "Copied payload to $payloadLetter`:"
-    }
+    Start-Step "Copying payload to $payloadLetter`: (the slow bit)"
+    $null = Assert-BuildDiskSafe -DiskNumber $UsbDiskNumber -ExpectedIdentity $targetIdentity `
+        -ProtectedDiskNumbers $protectedDisks -AllowNonUsb:$AllowNonUsbDisk
+    Assert-BuildPartitionMapping -DiskNumber $UsbDiskNumber -PartitionNumber $payloadPart.PartitionNumber -DriveLetter $payloadLetter
+    Start-BuildPhase 'copy USB payload'
+    Sync-BuildFiles -Files $payloadFiles -Destination (Join-Path $payloadDrive 'Payload') -Mirror -PreserveDirectories @('Logs')
+    Stop-BuildPhase 'copy USB payload'
+    Write-StepDone "Copied payload to $payloadLetter`:"
 
     if (Test-Path $bootsect) {
         Start-Step 'Writing legacy BIOS boot sector'
-        & $bootsect /nt60 $bootDrive /mbr 2>&1 | Out-Null
+        $null = Assert-BuildDiskSafe -DiskNumber $UsbDiskNumber -ExpectedIdentity $targetIdentity `
+            -ProtectedDiskNumbers $protectedDisks -AllowNonUsb:$AllowNonUsbDisk
+        Assert-BuildPartitionMapping -DiskNumber $UsbDiskNumber -PartitionNumber $bootPart.PartitionNumber -DriveLetter $bootLetter
+        & $bootsect /nt60 "${bootLetter}:" /mbr 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Write-StepSkipped "Legacy BIOS boot sector (bootsect failed - UEFI boot still works)"
         }
@@ -1380,9 +2042,14 @@ else {
     Write-Host '  USB deployment media is ready.' -ForegroundColor Green
     Write-Host '  Boot a target machine from it (F12 one-time boot menu on Dell).' -ForegroundColor DarkGray
 }
+Stop-BuildPhase 'output'
 
 Write-Host "  Build log: $script:BuildLog" -ForegroundColor DarkGray
 Write-Host ''
 
 Complete-WorkingFolder
 $global:LASTEXITCODE = 0
+}
+finally {
+    Write-BuildTotal
+}

@@ -1,11 +1,21 @@
+<#
+.SYNOPSIS
+    Overwrites explicitly selected internal disks with zeros inside WinPE.
+.DESCRIPTION
+    Uses DiskPart clean all, not a vendor SSD/NVMe sanitize command. An exit-zero
+    result is not a sanitization certificate or a read-back verification.
+    All disks start unchecked. Type WIPE after reviewing the selected disks.
+    Logs include the running script path/hash and are copied to writable media.
+#>
 param(
     [string]$Serial = 'Unknown'
 )
 
 $ErrorActionPreference = 'Stop'
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+. (Join-Path $PSScriptRoot 'AutoReset.Common.ps1')
+Assert-WinPEEnvironment
+. (Join-Path $PSScriptRoot 'AutoReset.UI.ps1')
 
 # Pat - Hide the PowerShell console window -------------------------
 #-------------------------------------------------------------------
@@ -46,13 +56,27 @@ function Write-Log {
     ) -ErrorAction SilentlyContinue
 }
 
-# ── UI helpers ───────────────────────────────────────────────────────
+Write-Log "Runtime script: $PSCommandPath"
+Write-Log "Runtime SHA256: $((Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash)"
 
-function UiFont {
-    param([double]$Size, [switch]$Bold)
-    $style = if ($Bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
-    New-Object System.Drawing.Font('Segoe UI', [single]$Size, $style)
+function Save-WipeLog {
+    foreach ($volume in @(Get-Volume -ErrorAction SilentlyContinue)) {
+        if (-not $volume.DriveLetter) { continue }
+        $root = "$($volume.DriveLetter):\"
+        if (-not (Test-Path -LiteralPath (Join-Path $root 'Payload\UNE-Payload.tag'))) { continue }
+        try {
+            $folder = Join-Path $root 'Logs'
+            New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop | Out-Null
+            $safeSerial = $Serial -replace '[^A-Za-z0-9-]', '_'
+            Copy-Item -LiteralPath $script:LogFile -Destination (
+                Join-Path $folder ("{0}_{1}_ZeroOverwrite.log" -f $safeSerial, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            ) -Force -ErrorAction Stop
+        }
+        catch { Write-Log "Could not save wipe log to media: $($_.Exception.Message)" 'WARN' }
+    }
 }
+
+# ── UI helpers ───────────────────────────────────────────────────────
 
 $script:AccentColor = [System.Drawing.Color]::FromArgb(39, 178, 217)
 
@@ -81,95 +105,32 @@ function Add-FormHotkeys {
     })
 }
 
-# Pat - Dynamic form factory ----------------------------------------
-#   Form is NOT auto-sized. FLP is NOT docked.
-#   Caller adds controls to $f.Tag (the FLP), then calls
-#   Set-FormSize -Form $f before ShowDialog().
-#   This avoids the Dock+AutoSize layout bug entirely.
-#--------------------------------------------------------------------
 function New-WipeForm {
-    param([string]$Title, [int]$Width = 540)
-    $f                 = New-Object System.Windows.Forms.Form
-    $f.AutoScaleMode   = [System.Windows.Forms.AutoScaleMode]::Font
-    $f.Font            = UiFont 10
-    $f.Text            = "KillDisk | $Title"
-    $f.StartPosition   = 'CenterScreen'
-    $f.FormBorderStyle = 'FixedDialog'
-    $f.MaximizeBox     = $false
-    $f.MinimizeBox     = $false
-    $f.ControlBox      = $false
-    $f.TopMost         = $true
-    $f.BackColor       = [System.Drawing.SystemColors]::Window
-    $f.AutoSize        = $false
-
-    $flp               = New-Object System.Windows.Forms.FlowLayoutPanel
-    $flp.FlowDirection = 'TopDown'
-    $flp.WrapContents  = $false
-    $flp.AutoSize      = $true
-    $flp.AutoSizeMode  = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-    $flp.Padding       = New-Object System.Windows.Forms.Padding(18, 16, 18, 16)
-    $flp.Location      = New-Object System.Drawing.Point(0, 0)
-    $f.Controls.Add($flp)
-    $f.Tag             = $flp
-
-    $f | Add-Member -NotePropertyName '_TargetWidth' -NotePropertyValue $Width
-
+    param([string]$Title, [int]$Width = 720, [int]$MinimumHeight = 260)
+    $f = New-ResetForm -Title "KillDisk | $Title" -Width $Width -MinimumHeight $MinimumHeight
     Add-FormHotkeys -Form $f
     return $f
 }
-#--------------------------------------------------------------------
-
-# Pat - Calculate and apply form size after all controls are added --
-#   Forces a layout pass on the FLP, then reads its ACTUAL rendered
-#   height (not GetPreferredSize, which ignores non-AutoSize children
-#   like ListView, ProgressBar, and TextBox).
-#   Caps height at 90 % of the screen working area.
-#--------------------------------------------------------------------
-function Set-FormSize {
-    param([Parameter(Mandatory)][System.Windows.Forms.Form]$Form)
-
-    $flp   = $Form.Tag
-    $width = $Form._TargetWidth
-
-    # Constrain FLP width so children stack in a single column
-    $flp.MaximumSize = New-Object System.Drawing.Size($width, 0)
-
-    # Force the FLP to lay out all children and resize itself.
-    # Because AutoSize + GrowAndShrink is set, after PerformLayout
-    # the FLP's Size.Height reflects the true content height —
-    # including non-AutoSize children (ListView, ProgressBar, etc.)
-    # that GetPreferredSize() would otherwise ignore.
-    $flp.PerformLayout()
-    $contentH = $flp.Size.Height
-
-    # Safety fallback — if the FLP hasn't resized yet (edge case),
-    # try GetPreferredSize as a backup
-    if ($contentH -lt 50) {
-        $pref     = $flp.GetPreferredSize(
-                        (New-Object System.Drawing.Size($width, 0)))
-        $contentH = [math]::Max($contentH, $pref.Height)
-    }
-
-    $screenH = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height
-    $maxH    = [math]::Floor($screenH * 0.9)
-    $finalH  = [math]::Min($contentH, $maxH)
-
-    $Form.ClientSize = New-Object System.Drawing.Size($width, $finalH)
-}
-#--------------------------------------------------------------------
 
 # ── Gather disks ─────────────────────────────────────────────────────
 
+try {
+$null = Get-Command diskpart.exe -ErrorAction Stop
+$protectedDisks = @(Get-DeploymentMediaDiskNumbers)
 $allDisks = @(Get-Disk | Sort-Object Number)
 $internalDisks = @($allDisks | Where-Object {
-    $_.BusType -notin @('USB', 'iSCSI', 'File Backed Virtual')
+    Test-EligibleTargetDisk -Disk $_ -ProtectedDiskNumbers $protectedDisks
 })
+$diskIdentities = @{}
+foreach ($disk in $internalDisks) {
+    $diskIdentities[[int]$disk.Number] = Get-DiskIdentity -Disk $disk
+}
 
 if ($internalDisks.Count -eq 0) {
     $errDlg = New-WipeForm -Title 'ERROR' -Width 520
 
     $errLbl             = New-Object System.Windows.Forms.Label
-    $errLbl.Text        = 'No internal disks found. Only USB and virtual disks are present.'
+    $errLbl.Text        = 'No eligible disks found. Deployment media, boot/system, USB, offline, read-only and unidentified disks are protected.'
     $errLbl.AutoSize    = $true
     $errLbl.MaximumSize = New-Object System.Drawing.Size(468, 0)
     $errDlg.Tag.Controls.Add($errLbl)
@@ -222,7 +183,7 @@ while (-not $confirmed) {
 
     # ── Disk selection ───────────────────────────────────────────────
 
-    $dlgSelect = New-WipeForm -Title 'Select Disk(s)' -Width 560
+    $dlgSelect = New-WipeForm -Title 'Select Disk(s)' -Width 800 -MinimumHeight 450
 
     $lblTitle             = New-Object System.Windows.Forms.Label
     $lblTitle.Text        = 'KillDisk - Disk Selection'
@@ -232,39 +193,25 @@ while (-not $confirmed) {
     $dlgSelect.Tag.Controls.Add($lblTitle)
 
     $lblInstr             = New-Object System.Windows.Forms.Label
-    $lblInstr.Text        = 'Select the disk(s) you wish to wipe. Note this process can take a while.'
+    $lblInstr.Text        = 'Select disks for a full logical zero overwrite. This can take hours. SSD/NVMe spare or remapped areas are not sanitized; use an approved device sanitization tool when required.'
     $lblInstr.AutoSize    = $true
     $lblInstr.MaximumSize = New-Object System.Drawing.Size(508, 0)
     $lblInstr.Margin      = New-Object System.Windows.Forms.Padding(0, 5, 0, 10)
     $dlgSelect.Tag.Controls.Add($lblInstr)
 
-    # Pat - DPI-aware row height calculation ----------------------------
-    $rowHeight    = [System.Windows.Forms.TextRenderer]::MeasureText(
-        'X', (UiFont 9)).Height + 4
-    $headerHeight = $rowHeight + 4
-    $listHeight   = [math]::Max(
-        $headerHeight + 22,
-        $headerHeight + ($internalDisks.Count * $rowHeight))
-    $list.Size        = New-Object System.Drawing.Size(508, $listHeight)
-    # Pat - MinimumSize ensures the FLP respects this height during layout
-    $list.MinimumSize = New-Object System.Drawing.Size(508, $listHeight)
-    #--------------------------------------------------------------------
     $list               = New-Object System.Windows.Forms.ListView
     $list.View          = 'Details'
     $list.CheckBoxes    = $true
     $list.FullRowSelect = $true
     $list.MultiSelect   = $false
     $list.GridLines     = $true
-    $list.Size          = New-Object System.Drawing.Size(508, $listHeight)
-    $list.MinimumSize   = New-Object System.Drawing.Size(508, $listHeight)
-    $list.Font          = UiFont 9
-    #------------------------------------------------------------------
 
     [void]$list.Columns.Add('Disk', 50)
     [void]$list.Columns.Add('Name', 218)
     [void]$list.Columns.Add('Size', 80)
     [void]$list.Columns.Add('Bus', 75)
     [void]$list.Columns.Add('Type', 75)
+    Initialize-DiskList -List $list -RowCount $internalDisks.Count
 
     $list.BeginUpdate()
     foreach ($d in $internalDisks) {
@@ -276,7 +223,7 @@ while (-not $confirmed) {
         [void]$item.SubItems.Add("$($d.BusType)")
         [void]$item.SubItems.Add($mediaType)
         $item.Tag     = $d.Number
-        $item.Checked = $true
+        $item.Checked = $false
         [void]$list.Items.Add($item)
     }
     $list.EndUpdate()
@@ -306,6 +253,7 @@ while (-not $confirmed) {
 
     $btnWipe             = New-Object System.Windows.Forms.Button
     $btnWipe.Text        = 'Wipe Selected'
+    $btnWipe.Enabled     = $false
     $btnWipe.AutoSize    = $true
     $btnWipe.MinimumSize = New-Object System.Drawing.Size(120, 32)
     $btnWipe.Padding     = New-Object System.Windows.Forms.Padding(12, 4, 12, 4)
@@ -377,7 +325,7 @@ while (-not $confirmed) {
 
     $diskSummary = @()
     foreach ($dn in $selectedDisks) {
-        $d = Get-Disk -Number $dn
+        $d = Assert-TargetDiskSafe -DiskNumber $dn -ExpectedIdentity $diskIdentities[$dn] -ProtectedDiskNumbers $protectedDisks
         $diskSummary += "    Disk $dn  |  $($d.FriendlyName)  |  $([math]::Round($d.Size / 1GB, 1)) GB"
     }
 
@@ -474,7 +422,7 @@ while (-not $confirmed) {
     $dlgConfirm2.Dispose()
 
     if ($confirm2Result -eq [System.Windows.Forms.DialogResult]::Yes) {
-        Write-Log 'User confirmed secure wipe by typing WIPE.'
+        Write-Log 'User confirmed logical zero overwrite by typing WIPE.'
         $confirmed = $true
     }
     else {
@@ -553,11 +501,12 @@ $diskIndex   = 0
 
 foreach ($diskNum in $selectedDisks) {
     $diskIndex++
-    $disk   = Get-Disk -Number $diskNum
+    $disk   = Assert-TargetDiskSafe -DiskNumber $diskNum -ExpectedIdentity $diskIdentities[$diskNum] -ProtectedDiskNumbers $protectedDisks
     $sizeGB = [math]::Round($disk.Size / 1GB, 1)
 
     $lblCurrent.Text = "Wiping disk ${diskNum}: $($disk.FriendlyName) ($sizeGB GB)..."
     $lblOverall.Text = "Disk $diskIndex of $($selectedDisks.Count)"
+    Set-FormSize -Form $dlgProgress
     [System.Windows.Forms.Application]::DoEvents()
 
     Write-Log "Starting clean all on disk ${diskNum}: $($disk.FriendlyName) ($sizeGB GB)"
@@ -568,12 +517,12 @@ select disk $diskNum
 clean all
 exit
 "@
-    $dpFile = Join-Path $logRoot "securewipe-disk${diskNum}.txt"
+    $dpFile = Join-Path $logRoot "zero-overwrite-disk${diskNum}.txt"
     Set-Content -Path $dpFile -Value $dpScript -Encoding Ascii
 
     $psi                        = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName               = 'diskpart.exe'
-    $psi.Arguments              = "/s $dpFile"
+    $psi.Arguments              = "/s `"$dpFile`""
     $psi.UseShellExecute        = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError  = $true
@@ -584,9 +533,9 @@ exit
     $sb      = New-Object System.Text.StringBuilder
     $stream  = $proc.StandardOutput.BaseStream
     $buffer  = New-Object byte[] 4096
-    $pctRx   = [regex]'(\d{1,3})%'
 
-    $baseProgress = ($diskIndex - 1) * 100
+    # DiskPart clean all does not supply a reliable percentage or time estimate.
+    $pbWipe.Style = 'Marquee'
 
     $readTask = $stream.ReadAsync($buffer, 0, $buffer.Length)
     while ($true) {
@@ -600,12 +549,6 @@ exit
             else {
                 $chunk = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $count)
                 [void]$sb.Append($chunk)
-                $hits = $pctRx.Matches($chunk)
-                if ($hits.Count -gt 0) {
-                    $pct = [int]$hits[$hits.Count - 1].Groups[1].Value
-                    $lblCurrent.Text = "Wiping disk ${diskNum}: $($disk.FriendlyName) ($sizeGB GB)... ${pct}%"
-                    $pbWipe.Value = [math]::Min($pbWipe.Maximum, $baseProgress + $pct)
-                }
             }
             $readTask = $stream.ReadAsync($buffer, 0, $buffer.Length)
         }
@@ -624,10 +567,13 @@ exit
     Write-Log "diskpart output for disk ${diskNum}`:`n$output"
     if ($stdErr.Trim()) { Write-Log "diskpart stderr: $stdErr" }
 
-    $passed = ($proc.ExitCode -eq 0)
+    $exitCode = $proc.ExitCode
+    $passed = ($exitCode -eq 0)
     $state  = if ($passed) { 'OK' } else { 'FAILED' }
     Write-Log ("Disk {0} clean all: {1} (exit {2}, {3:hh\:mm\:ss})" -f $diskNum, $state, $proc.ExitCode, $diskElapsed)
 
+    $proc.Dispose()
+    $pbWipe.Style = 'Continuous'
     $pbWipe.Value = [math]::Min($pbWipe.Maximum, $diskIndex * 100)
 
     $wipeResults += [pscustomobject]@{
@@ -635,7 +581,7 @@ exit
         Name       = $disk.FriendlyName
         SizeGB     = $sizeGB
         State      = $state
-        ExitCode   = $proc.ExitCode
+        ExitCode   = $exitCode
         Elapsed    = $diskElapsed
     }
 }
@@ -652,7 +598,7 @@ $resultText = if ($allPassed) { 'Complete' } else { 'Complete (with errors)' }
 
 Write-Log ''
 Write-Log '============================================================'
-Write-Log "  Secure Wipe $resultText"
+Write-Log "  Logical Zero Overwrite $resultText"
 Write-Log '============================================================'
 Write-Log "  Service tag  : $Serial"
 Write-Log "  Duration     : $('{0:hh\:mm\:ss}' -f $totalElapsed)"
@@ -664,6 +610,7 @@ foreach ($r in $wipeResults) {
         $r.DiskNumber, $r.Name, "$($r.SizeGB) GB", $r.State, $r.Elapsed)
 }
 Write-Log ''
+Save-WipeLog
 
 $summaryLines = @()
 foreach ($r in $wipeResults) {
@@ -689,7 +636,7 @@ $lblSummary.Margin      = New-Object System.Windows.Forms.Padding(0, 10, 0, 10)
 $dlgResult.Tag.Controls.Add($lblSummary)
 
 $lblSanit             = New-Object System.Windows.Forms.Label
-$lblSanit.Text        = "Service tag: $Serial`r`nDuration: $('{0:hh\:mm\:ss}' -f $totalElapsed)"
+$lblSanit.Text        = "Service tag: $Serial`r`nDuration: $('{0:hh\:mm\:ss}' -f $totalElapsed)`r`nResults reflect DiskPart exit status, not verified SSD/NVMe sanitization."
 $lblSanit.AutoSize    = $true
 $lblSanit.MaximumSize = New-Object System.Drawing.Size(508, 0)
 $lblSanit.ForeColor   = [System.Drawing.Color]::FromArgb(100, 100, 100)
@@ -726,5 +673,17 @@ $resultCloseTimer.Dispose()
 $dlgResult.Dispose()
 
 Write-Log 'User clicked Shut Down. Powering off.'
+Save-WipeLog
 & wpeutil.exe shutdown
 exit 0
+}
+catch {
+    Write-Log "Wipe stopped: $($_.Exception.Message)" 'ERROR'
+    Save-WipeLog
+    [void][Win32Console]::ShowWindow([Win32Console]::GetConsoleWindow(), 5)
+    [void][System.Windows.Forms.MessageBox]::Show(
+        "Wipe stopped: $($_.Exception.Message)`r`nReview $script:LogFile before restarting. Previously completed disks may already be erased.",
+        'KillDisk stopped', [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error)
+    exit 1
+}
