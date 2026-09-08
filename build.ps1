@@ -568,6 +568,7 @@ function Assert-BuildDiskSafe {
 
 function Get-BuildProtectedDiskNumbers {
     param([Parameter(Mandatory)][string[]]$Paths)
+    $supportsFilePath = (Get-Command -Name Get-Partition -ErrorAction Stop).Parameters.ContainsKey('FilePath')
     $numbers = foreach ($path in $Paths) {
         if (-not $path) { continue }
         $existing = [IO.Path]::GetFullPath($path)
@@ -577,7 +578,14 @@ function Get-BuildProtectedDiskNumbers {
             if (-not $parent -or $parent -eq $existing) { throw "Cannot identify source/output disk: $path" }
             $existing = $parent
         }
-        $partitions = @(Get-Partition -FilePath $existing -ErrorAction Stop)
+        if ($supportsFilePath) {
+            $partitions = @(Get-Partition -FilePath $existing -ErrorAction Stop)
+        }
+        else {
+            $qualifier = Split-Path -Path $existing -Qualifier
+            if ($qualifier -notmatch '^[A-Za-z]:$') { throw "Cannot identify source/output disk: $path" }
+            $partitions = @(Get-Partition -DriveLetter $qualifier.TrimEnd(':') -ErrorAction Stop)
+        }
         $diskNumbers = @($partitions.DiskNumber | Sort-Object -Unique)
         if ($diskNumbers.Count -ne 1) { throw "Cannot unambiguously identify source/output disk: $path" }
         [int]$diskNumbers[0]

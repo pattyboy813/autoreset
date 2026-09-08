@@ -152,6 +152,14 @@ Describe 'Builder disk and volume safeguards' {
         Mock Get-Partition { [pscustomobject]@{ DiskNumber = [uint32]4 }; [pscustomobject]@{ DiskNumber = [uint32]5 } } -ParameterFilter { $null -ne $FilePath }
         { Get-BuildProtectedDiskNumbers -Paths @($TestDrive) } | Should -Throw '*unambiguously*'
     }
+    It 'falls back to drive-letter mapping when Get-Partition lacks FilePath support' {
+        Mock Get-Command { [pscustomobject]@{ Parameters = @{ DriveLetter = $true } } } -ParameterFilter { $Name -eq 'Get-Partition' }
+        Mock Test-Path { $true }
+        Mock Split-Path { 'C:' } -ParameterFilter { $Qualifier }
+        Mock Get-Partition { [pscustomobject]@{ DiskNumber = [uint32]4 } } -ParameterFilter { $DriveLetter -eq 'C' }
+        @(Get-BuildProtectedDiskNumbers -Paths @($TestDrive)) | Should -Be @(4)
+        Should -Invoke Get-Partition -Times 1 -ParameterFilter { $DriveLetter -eq 'C' }
+    }
 }
 
 Describe 'USB validation reports failure in its own scope' {
