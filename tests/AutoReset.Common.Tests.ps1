@@ -1,5 +1,5 @@
-BeforeAll {
-    . (Join-Path $PSScriptRoot '../AutoReset.Common.ps1')
+﻿BeforeAll {
+    . (Join-Path $PSScriptRoot '../usb-scripts/autoreset.common.ps1')
     # Storage cmdlets do not exist on Linux; these signatures allow safe mocks there.
     if (-not (Get-Command Get-Disk -ErrorAction SilentlyContinue)) {
         function Get-Disk { [CmdletBinding()]param([int]$Number) }
@@ -121,7 +121,7 @@ Describe 'WinPE-only operation' {
             $internalDisks = @(New-TestDisk)
             $diskIdentities = @{}
             $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                (Join-Path $PSScriptRoot '../Invoke-KillDisk.ps1'), [ref]$null, [ref]$null)
+                (Join-Path $PSScriptRoot '../usb-scripts/killdisk.ps1'), [ref]$null, [ref]$null)
             # Execute only the identity-map loop, never the destructive entry point.
             $loop = $ast.Find({
                 param($node)

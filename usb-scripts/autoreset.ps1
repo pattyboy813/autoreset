@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     AutoReset - Automated Windows installation tool for WinPE.
 
@@ -32,8 +32,8 @@ trap {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-. (Join-Path $PSScriptRoot 'AutoReset.Common.ps1')
-. (Join-Path $PSScriptRoot 'AutoReset.UI.ps1')
+. (Join-Path $PSScriptRoot 'autoreset.common.ps1')
+. (Join-Path $PSScriptRoot 'autoreset.ui.ps1')
 Assert-WinPEEnvironment
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -202,7 +202,7 @@ function Initialize-Configuration {
     foreach ($candidate in @(
         $(if ($script:MediaRoot) { Join-Path $script:MediaRoot 'Config\reset.json' }),
         (Join-Path $script:ImagePayloadRoot 'Config\reset.json'),
-        (Join-Path $PSScriptRoot '..\Config\reset.json'))) {
+        (Join-Path $PSScriptRoot '..\reset.json'))) {
         if ($candidate -and (Test-Path -LiteralPath $candidate)) { $configPath = $candidate; break }
     }
     if ($configPath) {
@@ -1271,7 +1271,7 @@ if (Get-Config 'ConfirmBeforeWipe' $true) {
                 $wipeScript = $null
                 foreach ($root in @($script:MediaRoot, $script:ImagePayloadRoot)) {
                     if (-not $root) { continue }
-                    $candidate = Join-Path $root 'Scripts\Invoke-KillDisk.ps1'
+                    $candidate = Join-Path $root 'Scripts\killdisk.ps1'
                     Write-Log "Checking for wipe script: $candidate"
                     if (Test-Path $candidate) { $wipeScript = $candidate; break }
                 }
@@ -1285,9 +1285,9 @@ if (Get-Config 'ConfirmBeforeWipe' $true) {
                     exit 0
                 }
                 else {
-                    Write-Log 'Invoke-KillDisk.ps1 not found on media.' 'ERROR'
+                    Write-Log 'killdisk.ps1 not found on media.' 'ERROR'
                     [void][System.Windows.Forms.MessageBox]::Show(
-                        'Invoke-KillDisk.ps1 was not found on the deployment media.',
+                        'killdisk.ps1 was not found on the deployment media.',
                         (Title 'Error'),
                         [System.Windows.Forms.MessageBoxButtons]::OK,
                         [System.Windows.Forms.MessageBoxIcon]::Error)

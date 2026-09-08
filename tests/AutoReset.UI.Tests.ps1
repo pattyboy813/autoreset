@@ -1,7 +1,7 @@
-# These tests display harmless forms only; they never import a deployment entry point.
+﻿# These tests display harmless forms only; they never import a deployment entry point.
 Describe 'WinForms disk layout' -Skip:($env:OS -ne 'Windows_NT') {
     BeforeAll {
-        . (Join-Path $PSScriptRoot '../AutoReset.UI.ps1')
+        . (Join-Path $PSScriptRoot '../usb-scripts/autoreset.ui.ps1')
     }
     It 'keeps one-disk rows visible and all content reachable' {
         $form = New-ResetForm -Title 'Layout test' -Width 800 -MinimumHeight 450

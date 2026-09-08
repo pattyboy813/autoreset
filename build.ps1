@@ -7,15 +7,16 @@
     Deployment Tools and WinPE add-on. Use -InstallPrerequisites to install
     missing components.
 
-    The canonical runtime sources are Invoke-AutoReset.ps1, Invoke-KillDisk.ps1,
-    AutoReset.Common.ps1 and AutoReset.UI.ps1 next to this builder. These explicit
-    files are bundled into boot.wim at Payload\Scripts and mirrored to the
-    deployment media's Payload\Scripts; Payload\Scripts is not a source folder.
-    Bundled runtime scripts use UTF-8 with a BOM for Windows PowerShell 5.1.
-    Supply configuration at Payload\Config\reset.json. Optional assets live in
-    Payload\Images, Payload\Drivers and Payload\Tools. OutputRoot\Images\install.wim
-    takes precedence over Payload\Images\install.wim. An image is required unless
-    -SkipPayload is explicit. WinPEDrivers is injected for both USB and ISO builds.
+    The canonical runtime sources are usb-scripts\autoreset.ps1,
+    usb-scripts\killdisk.ps1, usb-scripts\autoreset.common.ps1 and
+    usb-scripts\autoreset.ui.ps1. These explicit files are bundled into
+    boot.wim at Payload\Scripts and mirrored to the deployment media's
+    Payload\Scripts; Payload\Scripts is not a source folder. Bundled runtime
+    scripts use UTF-8 with a BOM for Windows PowerShell 5.1. Supply
+    configuration at reset.json. Optional source assets live in win-images,
+    device-drivers, tools and winpe-drivers. OutputRoot\Images\install.wim
+    takes precedence over win-images\install.wim. An image is required unless
+    -SkipPayload is explicit. winpe-drivers is injected for both USB and ISO builds.
     The default configuration selects Windows 11 Pro by exact edition
     name, matching the default -PrepareImage edition. ImageIndex defaults to
     null so multi-index media is supported. If you pin an ImageIndex, it must
@@ -25,10 +26,10 @@
     custom answer files, integrate equivalent WinRE initialization/verification
     yourself and set SetupRecovery=false to preserve your answer files.
 
-    Driver archives use ZIP unless Payload\Tools\7za.exe is a compatible,
+    Driver archives use ZIP unless tools\7za.exe is a compatible,
     standalone AMD64 extractor. A supplied incompatible extractor is an error.
     The trusted ADK AMD64 bootsect.exe is bundled in WinPE Windows\System32
-    (on PATH) and Payload\Tools for legacy BIOS deployment.
+    (on PATH) and tools for legacy BIOS deployment.
     Content-verified caches separate the serviced WinPE base from runtime
     customization. Identical warm builds skip mounting; script/config/tool changes
     customize the cached base without reinstalling packages or boot drivers.
@@ -85,22 +86,22 @@
     ZIP uses Optimal for Balanced and Maximum. Changing profiles rebuilds archives.
 
 .EXAMPLE
-    .\Build-WinPE.ps1 -UpdateUsb
+    .\build.ps1 -UpdateUsb
 
 .EXAMPLE
-    .\Build-WinPE.ps1 -UsbDiskNumber 2
+    .\build.ps1 -UsbDiskNumber 2
 
 .EXAMPLE
-    .\Build-WinPE.ps1 -PrepareImage -SourceImage D:\sources\install.esd
+    .\build.ps1 -PrepareImage -SourceImage D:\sources\install.esd
 
 .EXAMPLE
-    .\Build-WinPE.ps1 -PrepareDrivers
+    .\build.ps1 -PrepareDrivers
 
 .EXAMPLE
-    .\Build-WinPE.ps1 -ValidateUsb
+    .\build.ps1 -ValidateUsb
 
 .EXAMPLE
-    .\Build-WinPE.ps1 -BuildIso
+    .\build.ps1 -BuildIso
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Preparation and cleanup helpers consume script-scoped parameters; mode switches also select parameter sets.')]
 [CmdletBinding(DefaultParameterSetName = 'USB')]
@@ -801,7 +802,7 @@ function Copy-RuntimeScript {
 
 function Get-RuntimeSourceFiles {
     param([Parameter(Mandatory)][string]$Root)
-    foreach ($name in @('Invoke-AutoReset.ps1', 'Invoke-KillDisk.ps1', 'AutoReset.Common.ps1', 'AutoReset.UI.ps1')) {
+    foreach ($name in @('autoreset.ps1', 'killdisk.ps1', 'autoreset.common.ps1', 'autoreset.ui.ps1')) {
         $path = Join-Path $Root $name
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required runtime source missing: $path" }
         Assert-NoReparsePath -Path $path
@@ -821,14 +822,24 @@ function Sync-RuntimePayload {
         }
     }
     foreach ($file in $RuntimeFiles) { Copy-RuntimeScript -Source $file.FullName -Destination (Join-Path $scripts $file.Name) }
-    foreach ($name in @('Config', 'Tools')) {
-        $source = Join-Path $PayloadSource $name
-        $dest = Join-Path $Destination $name
-        if (Test-Path -LiteralPath $source -PathType Container) {
-            Invoke-Robocopy -Source $source -Dest $dest -Extra @('/MIR') -What "$name runtime sync"
+
+    $configSource = Join-Path $PayloadSource 'reset.json'
+    $configDestDir = Join-Path $Destination 'Config'
+    New-Item -ItemType Directory -Path $configDestDir -Force | Out-Null
+    foreach ($stale in @(Get-ChildItem -LiteralPath $configDestDir -Force -ErrorAction SilentlyContinue)) {
+        if ($stale.PSIsContainer -or $stale.Name -ne 'reset.json') {
+            Remove-Item -LiteralPath $stale.FullName -Recurse -Force -ErrorAction Stop
         }
-        elseif (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction Stop }
     }
+    Copy-ChangedFile -Source $configSource -Destination (Join-Path $configDestDir 'reset.json')
+
+    $toolsSource = Join-Path $PayloadSource 'tools'
+    $toolsDest = Join-Path $Destination 'Tools'
+    if (Test-Path -LiteralPath $toolsSource -PathType Container) {
+        Invoke-Robocopy -Source $toolsSource -Dest $toolsDest -Extra @('/MIR') -What 'Tools runtime sync'
+    }
+    elseif (Test-Path -LiteralPath $toolsDest) { Remove-Item -LiteralPath $toolsDest -Recurse -Force -ErrorAction Stop }
+
     if ($BootsectSource) {
         $tools = Join-Path $Destination 'Tools'
         New-Item -ItemType Directory -Path $tools -Force | Out-Null
@@ -845,7 +856,7 @@ function Sync-RuntimePayload {
 
 function Assert-BuildPayload {
     param([string]$PayloadSource, [string]$InstallImage, [switch]$BootOnly)
-    $config = Join-Path $PayloadSource 'Config\reset.json'
+    $config = Join-Path $PayloadSource 'reset.json'
     if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { throw "Required configuration missing: $config" }
     Assert-NoReparsePath -Path $PayloadSource -Recurse
     $settings = Get-Content -LiteralPath $config -Raw | ConvertFrom-Json -ErrorAction Stop
@@ -1100,10 +1111,10 @@ function Set-WinPEStartup {
     if ($wpeinitArgs) { $shellInit += ',' + $wpeinitArgs }
     Set-Content -LiteralPath (Join-Path $System32Path 'winpeshl.ini') -Encoding Ascii -Value @(
         '[LaunchApps]', $shellInit,
-        '%SYSTEMDRIVE%\Windows\System32\WindowsPowerShell\v1.0\powershell.exe, -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File X:\Payload\Scripts\Invoke-AutoReset.ps1')
+        '%SYSTEMDRIVE%\Windows\System32\WindowsPowerShell\v1.0\powershell.exe, -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File X:\Payload\Scripts\autoreset.ps1')
     Set-Content -LiteralPath (Join-Path $System32Path 'startnet.cmd') -Encoding Ascii -Value @(
         '@echo off', "wpeinit$wpeinitArgs",
-        'X:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File X:\Payload\Scripts\Invoke-AutoReset.ps1')
+        'X:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File X:\Payload\Scripts\autoreset.ps1')
 }
 
 function Assert-RuntimeExtractor {
@@ -1380,10 +1391,10 @@ function Invoke-ImagePreparation {
 # ── Driver preparation (standalone) ─────────────────────────────────
 
 function Invoke-DriverPreparation {
-    $driversRoot = Join-Path $ScriptRoot 'Payload\Drivers'
+    $driversRoot = Join-Path $ScriptRoot 'device-drivers'
     Assert-NoReparsePath -Path $driversRoot -Recurse
     Assert-NoReparsePath -Path $preparedDriversRoot -Recurse
-    $extractor = Join-Path $ScriptRoot 'Payload\Tools\7za.exe'
+    $extractor = Join-Path $ScriptRoot 'tools\7za.exe'
     $script:RuntimeExtractor = if (Test-Path -LiteralPath $extractor -PathType Leaf) { Assert-RuntimeExtractor -Path $extractor }
 
     if ($NoZip) {
@@ -1462,8 +1473,8 @@ function Invoke-UsbValidation {
         else {
             Report ("PASS: PAYLOAD found ({0}:, {1:N1} GB free)" -f $payload.DriveLetter, ($payload.SizeRemaining / 1GB))
             $payloadRoot = "$($payload.DriveLetter):\Payload"
-            $required = @('UNE-Payload.tag', 'Config\reset.json', 'Scripts\Invoke-AutoReset.ps1',
-                'Scripts\Invoke-KillDisk.ps1', 'Scripts\AutoReset.Common.ps1', 'Scripts\AutoReset.UI.ps1')
+            $required = @('UNE-Payload.tag', 'Config\reset.json', 'Scripts\autoreset.ps1',
+                'Scripts\killdisk.ps1', 'Scripts\autoreset.common.ps1', 'Scripts\autoreset.ui.ps1')
             if (-not $SkipPayload) { $required += 'Images\install.wim' }
             foreach ($rel in $required) {
                 if (Test-Path (Join-Path $payloadRoot $rel)) { Report "PASS: Payload\$rel" }
@@ -1646,16 +1657,17 @@ $modeName = switch ($PSCmdlet.ParameterSetName) {
 }
 Show-Header $modeName
 
-$payloadSrc = Join-Path $ScriptRoot 'Payload'
-$runtimeFiles = @(Get-RuntimeSourceFiles -Root $ScriptRoot)
+$payloadSrc = $ScriptRoot
+$runtimeSourceRoot = Join-Path $ScriptRoot 'usb-scripts'
+$runtimeFiles = @(Get-RuntimeSourceFiles -Root $runtimeSourceRoot)
 $externalInstallWim = Join-Path $preparedImagesRoot 'install.wim'
-$localInstallWim = Join-Path $payloadSrc 'Images\install.wim'
+$localInstallWim = Join-Path $payloadSrc 'win-images\install.wim'
 $installWim = if (Test-Path -LiteralPath $externalInstallWim -PathType Leaf) { $externalInstallWim } else { $localInstallWim }
 Assert-BuildPayload -PayloadSource $payloadSrc -InstallImage $installWim -BootOnly:$SkipPayload
 Assert-NoReparsePath -Path $cacheDir -Recurse
 Assert-NoReparsePath -Path $preparedDriversRoot -Recurse
-Assert-NoReparsePath -Path (Join-Path $ScriptRoot 'WinPEDrivers') -Recurse
-$runtimeExtractorPath = Join-Path $payloadSrc 'Tools\7za.exe'
+Assert-NoReparsePath -Path (Join-Path $ScriptRoot 'winpe-drivers') -Recurse
+$runtimeExtractorPath = Join-Path $payloadSrc 'tools\7za.exe'
 $script:RuntimeExtractor = if (Test-Path -LiteralPath $runtimeExtractorPath -PathType Leaf) {
     Assert-RuntimeExtractor -Path $runtimeExtractorPath
 }
@@ -1775,7 +1787,7 @@ $packages = @(
     'WinPE-StorageWMI'
 )
 
-$winpeDrivers       = Join-Path $ScriptRoot 'WinPEDrivers'
+$winpeDrivers       = Join-Path $ScriptRoot 'winpe-drivers'
 $srcWinpeWim        = Join-Path $winpeRoot 'en-us\winpe.wim'
 $ocDir = Join-Path $winpeRoot 'WinPE_OCs'
 $packagePaths = @()
@@ -1798,8 +1810,8 @@ foreach ($cab in $packagePaths) {
     $baseParts += "cab:$relativeCab|$((Get-FileHash -LiteralPath $cab -Algorithm SHA256).Hash)"
 }
 $runtimeParts = @(
-    "config:$(Get-ContentTreeHash -Path (Join-Path $payloadSrc 'Config'))",
-    "tools:$(Get-ContentTreeHash -Path (Join-Path $payloadSrc 'Tools'))",
+    "config:$((Get-FileHash -LiteralPath (Join-Path $payloadSrc 'reset.json') -Algorithm SHA256).Hash)",
+    "tools:$(Get-ContentTreeHash -Path (Join-Path $payloadSrc 'tools'))",
     "bootsect:$((Get-FileHash -LiteralPath $bootsect -Algorithm SHA256).Hash)",
     "res:$WinPEResolution"
 )
@@ -1828,7 +1840,7 @@ $externalPayloadFiles = @()
 
 if (-not $SkipPayload) {
     Start-Step 'Planning direct payload copies'
-    $localImages = Join-Path $payloadSrc 'Images'
+    $localImages = Join-Path $payloadSrc 'win-images'
     if (Test-Path -LiteralPath $localImages -PathType Container) {
         foreach ($file in Get-MediaFileInventory -Root $localImages) {
             if ($file.RelativePath -eq 'install.wim') { continue }
@@ -1843,7 +1855,7 @@ if (-not $SkipPayload) {
     Write-StepDone 'Planned direct payload copies'
 
     Start-BuildPhase 'drivers'
-    $driversSrc = Join-Path $payloadSrc 'Drivers'
+    $driversSrc = Join-Path $payloadSrc 'device-drivers'
     if (Test-Path -LiteralPath $driversSrc) {
         $modelFolders = @(Get-ChildItem -LiteralPath $driversSrc -Directory -ErrorAction SilentlyContinue |
             Sort-Object Name)
@@ -1876,7 +1888,7 @@ if (-not $SkipPayload) {
         }
     }
     else {
-        Write-StepSkipped 'No Payload\Drivers folder found'
+        Write-StepSkipped 'No device-drivers folder found'
     }
     Stop-BuildPhase 'drivers'
 }

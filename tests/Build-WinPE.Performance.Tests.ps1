@@ -1,5 +1,5 @@
-BeforeAll {
-    $path = Join-Path (Split-Path -Parent $PSScriptRoot) 'Build-WinPE.ps1'
+﻿BeforeAll {
+    $path = Join-Path (Split-Path -Parent $PSScriptRoot) 'build.ps1'
     $errors = $null
     $script:BuilderAst = [System.Management.Automation.Language.Parser]::ParseFile(
         $path, [ref]$null, [ref]$errors)
