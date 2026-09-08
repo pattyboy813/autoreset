@@ -10,14 +10,31 @@
     USB copy of reset.json overrides the configuration baked into boot.wim.
     Press F3 at any time to open the log in Notepad.
     Press F8 at any time for a command prompt.
-    Press Ctrl+Shift+W on the disk confirmation screen for secure wipe.
+    Press Ctrl+Shift+W on the disk confirmation screen for disk overwrite.
 #>
 param()
 
 $ErrorActionPreference = 'Stop'
 
+trap {
+    $failure = $_
+    try { Show-Console } catch { }
+    try { Write-Log "AutoReset stopped: $($failure.Exception.Message)" 'ERROR' } catch { }
+    try {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "AutoReset stopped. No further deployment actions will run.`r`n`r`n$($failure.Exception.Message)`r`n`r`nLog: $script:LogFile",
+            'AutoReset error', 'OK', 'Error')
+    }
+    catch { Write-Host "AutoReset stopped: $($failure.Exception.Message)" -ForegroundColor Red }
+    exit 1
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+. (Join-Path $PSScriptRoot 'AutoReset.Common.ps1')
+. (Join-Path $PSScriptRoot 'AutoReset.UI.ps1')
+Assert-WinPEEnvironment
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
@@ -115,10 +132,63 @@ function Initialize-Configuration {
         $(if ($script:MediaRoot) { Join-Path $script:MediaRoot 'Config\reset.json' }),
         (Join-Path $script:ImagePayloadRoot 'Config\reset.json'),
         (Join-Path $PSScriptRoot '..\Config\reset.json'))) {
-        if ($candidate -and (Test-Path $candidate)) { $configPath = $candidate; break }
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) { $configPath = $candidate; break }
     }
     if ($configPath) {
-        try { $script:ConfigJson = Get-Content -Path $configPath -Raw | ConvertFrom-Json } catch { }
+        try {
+            $json = Get-Content -LiteralPath $configPath -Raw
+            if (-not $json.TrimStart().StartsWith('{')) { throw 'reset.json must contain a JSON object.' }
+            $script:ConfigJson = $json | ConvertFrom-Json -ErrorAction Stop
+            Assert-Configuration -Config $script:ConfigJson
+        }
+        catch { throw "Invalid configuration '$configPath': $($_.Exception.Message)" }
+    }
+}
+
+function Assert-RelativePayloadPath {
+    param([Parameter(Mandatory)][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match '[\x00-\x1f":*?<>|]' -or
+        $Path -match '^[\\/]' -or ($Path -split '[\\/]' | Where-Object { $_ -in @('..', '.', '') -or $_ -match '[ .]$' })) {
+        throw "Invalid relative payload path '$Path'."
+    }
+}
+
+function Assert-Configuration {
+    param($Config)
+    if ($null -eq $Config -or $Config.GetType() -ne [System.Management.Automation.PSCustomObject]) {
+        throw 'reset.json must contain a JSON object.'
+    }
+    foreach ($name in @('ConfirmBeforeWipe', 'ContinueOnDriverError', 'SetupRecovery', 'DriversRequired')) {
+        if ($Config.PSObject.Properties.Name -contains $name -and $Config.$name -isnot [bool]) {
+            throw "$name must be a JSON boolean."
+        }
+    }
+    foreach ($name in @('ImageIndex', 'TargetDiskNumber')) {
+        if ($Config.PSObject.Properties.Name -contains $name -and $null -ne $Config.$name) {
+            $value = $Config.$name
+            $minimum = if ($name -eq 'ImageIndex') { 1 } else { 0 }
+            if (($value -isnot [int] -and $value -isnot [long]) -or $value -lt $minimum -or $value -gt [int]::MaxValue) {
+                throw "$name must be an integer >= $minimum or null."
+            }
+        }
+    }
+    foreach ($name in @('ImageFile', 'ImageEdition')) {
+        if ($Config.PSObject.Properties.Name -contains $name) {
+            if ($Config.$name -isnot [string] -or [string]::IsNullOrWhiteSpace($Config.$name)) {
+                throw "$name must be a nonempty string."
+            }
+        }
+    }
+    if ($Config.PSObject.Properties.Name -contains 'ImageFile') { Assert-RelativePayloadPath $Config.ImageFile }
+    if ($Config.PSObject.Properties.Name -contains 'DriverMap') {
+        if ($Config.DriverMap -isnot [array]) { throw 'DriverMap must be a JSON array.' }
+        foreach ($entry in $Config.DriverMap) {
+            if ($null -eq $entry -or $entry.GetType() -ne [System.Management.Automation.PSCustomObject] -or $entry.Match -isnot [string] -or
+                [string]::IsNullOrWhiteSpace($entry.Match) -or $entry.Folder -isnot [string]) {
+                throw 'Each DriverMap entry requires nonempty Match and Folder strings.'
+            }
+            Assert-RelativePayloadPath $entry.Folder
+        }
     }
 }
 
@@ -133,21 +203,16 @@ function Get-Config {
 
 function Resolve-MediaFile {
     param([Parameter(Mandatory)][string]$RelativePath)
+    Assert-RelativePayloadPath $RelativePath
     foreach ($root in @($script:MediaRoot, $script:ImagePayloadRoot)) {
         if (-not $root) { continue }
         $full = Join-Path $root $RelativePath
-        if (Test-Path $full) { return $full }
+        if (Test-Path -LiteralPath $full) { return $full }
     }
     return $null
 }
 
 # ── UI helpers ───────────────────────────────────────────────────────
-
-function UiFont {
-    param([double]$Size, [switch]$Bold)
-    $style = if ($Bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
-    New-Object System.Drawing.Font('Segoe UI', [single]$Size, $style)
-}
 
 $script:AccentColor = [System.Drawing.Color]::FromArgb(39, 178, 217)
 
@@ -171,33 +236,10 @@ function Title { param([string]$Suffix) "AutoReset v$($script:Version)$(if ($Suf
 function New-BaseForm {
     param(
         [AllowEmptyString()][Parameter(Mandatory)][string]$TitleSuffix,
-        [int]$Width = 560
+        [int]$Width = 720,
+        [int]$MinimumHeight = 260
     )
-    $f                 = New-Object System.Windows.Forms.Form
-    $f.AutoScaleMode   = [System.Windows.Forms.AutoScaleMode]::Font
-    $f.Font            = UiFont 10
-    $f.Text            = Title $TitleSuffix
-    $f.StartPosition   = 'CenterScreen'
-    $f.FormBorderStyle = 'FixedDialog'
-    $f.MaximizeBox     = $false
-    $f.MinimizeBox     = $false
-    $f.ControlBox      = $false
-    $f.TopMost         = $true
-    $f.BackColor       = [System.Drawing.SystemColors]::Window
-    $f.KeyPreview      = $true
-    $f.AutoSize        = $false
-
-    $flp               = New-Object System.Windows.Forms.FlowLayoutPanel
-    $flp.FlowDirection = 'TopDown'
-    $flp.WrapContents  = $false
-    $flp.AutoSize      = $true
-    $flp.AutoSizeMode  = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-    $flp.Padding       = New-Object System.Windows.Forms.Padding(20)
-    $flp.Location      = New-Object System.Drawing.Point(0, 0)
-    $f.Controls.Add($flp)
-    $f.Tag             = $flp
-
-    $f | Add-Member -NotePropertyName '_TargetWidth' -NotePropertyValue $Width
+    $f = New-ResetForm -Title (Title $TitleSuffix) -Width $Width -MinimumHeight $MinimumHeight
 
     $f.Add_KeyDown({
         if ($_.KeyCode -eq [System.Windows.Forms.Keys]::F3) {
@@ -211,44 +253,6 @@ function New-BaseForm {
     })
     return $f
 }
-# Pat - Calculate and apply form size after all controls are added --
-#   Forces a layout pass on the FLP, then reads its ACTUAL rendered
-#   height (not GetPreferredSize, which ignores non-AutoSize children
-#   like ListView, ProgressBar, and TextBox).
-#   Caps height at 90 % of the screen working area.
-#--------------------------------------------------------------------
-function Set-FormSize {
-    param([Parameter(Mandatory)][System.Windows.Forms.Form]$Form)
-
-    $flp   = $Form.Tag
-    $width = $Form._TargetWidth
-
-    # Constrain FLP width so children stack in a single column
-    $flp.MaximumSize = New-Object System.Drawing.Size($width, 0)
-
-    # Force the FLP to lay out all children and resize itself.
-    # Because AutoSize + GrowAndShrink is set, after PerformLayout
-    # the FLP's Size.Height reflects the true content height —
-    # including non-AutoSize children (ListView, ProgressBar, etc.)
-    # that GetPreferredSize() would otherwise ignore.
-    $flp.PerformLayout()
-    $contentH = $flp.Size.Height
-
-    # Safety fallback — if the FLP hasn't resized yet (edge case),
-    # try GetPreferredSize as a backup
-    if ($contentH -lt 50) {
-        $pref     = $flp.GetPreferredSize(
-                        (New-Object System.Drawing.Size($width, 0)))
-        $contentH = [math]::Max($contentH, $pref.Height)
-    }
-
-    $screenH = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height
-    $maxH    = [math]::Floor($screenH * 0.9)
-    $finalH  = [math]::Min($contentH, $maxH)
-
-    $Form.ClientSize = New-Object System.Drawing.Size($width, $finalH)
-}
-#--------------------------------------------------------------------
 
 # ── State ────────────────────────────────────────────────────────────
 
@@ -262,6 +266,10 @@ $script:DriverFolder = $null
 $script:DriversAdded = 0
 $script:StepWarnings = @()
 $script:AllDisks     = @()
+$script:ProtectedDiskNumbers = @()
+$script:TargetIdentity = $null
+$script:Preflight = $null
+$script:PartitionsVerified = $false
 
 # ── External tool runner ────────────────────────────────────────────
 
@@ -396,6 +404,8 @@ function Save-DeviceLog {
 # ── Copy logs to installed OS ────────────────────────────────────────
 
 function Copy-LogsToTarget {
+    if (-not $script:PartitionsVerified) { return }
+    Assert-TargetPartitions
     New-Item -ItemType Directory -Path 'W:\Windows\Temp\SMSTSLog' -Force -ErrorAction SilentlyContinue | Out-Null
     Copy-Item $script:LogFile   'W:\Windows\Temp\AutoReset.log'        -Force -ErrorAction SilentlyContinue
     Copy-Item $script:DetailLog 'W:\Windows\Temp\AutoReset-Detail.log' -Force -ErrorAction SilentlyContinue
@@ -411,6 +421,397 @@ function Get-PrimaryDriveLetter {
         Sort-Object Size -Descending)
     if ($parts.Count -gt 0) { return "$($parts[0].DriveLetter):" }
     return '-'
+}
+
+function Invoke-KillDiskProcess {
+    param([Parameter(Mandatory)][string]$ScriptPath, [Parameter(Mandatory)][string]$Serial)
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Serial "{1}"' -f $ScriptPath, $Serial
+    Write-Log "Launching secure wipe: powershell.exe $arguments"
+    $process = Start-Process -FilePath "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList $arguments -Wait -PassThru
+    Write-Log "Secure wipe process exit code: $($process.ExitCode)"
+    if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) {
+        throw "Secure wipe did not complete successfully (exit code $($process.ExitCode)). Review the KillDisk log before continuing."
+    }
+}
+
+function Get-InitialTargetDisk {
+    param([object[]]$Disks, [int[]]$ProtectedDiskNumbers, $ConfiguredNumber)
+    $eligible = @($Disks | Where-Object {
+        Test-EligibleTargetDisk -Disk $_ -ProtectedDiskNumbers $ProtectedDiskNumbers
+    })
+    if ($null -ne $ConfiguredNumber) {
+        $selected = @($eligible | Where-Object { $_.Number -eq $ConfiguredNumber })
+        if ($selected.Count -ne 1) { throw "Configured disk $ConfiguredNumber is missing or unsafe." }
+        return $selected[0]
+    }
+    if ($eligible.Count -eq 0) { throw 'No eligible internal disk with a stable identity was found.' }
+    if ($eligible.Count -eq 1) { return $eligible[0] }
+    return $null
+}
+
+function Assert-DeploymentLettersAvailable {
+    foreach ($letter in @('S', 'W', 'R')) {
+        $partitions = @(Get-Partition -ErrorAction Stop | Where-Object { "$($_.DriveLetter)" -eq $letter })
+        $volumes = @(Get-Volume -ErrorAction Stop | Where-Object { "$($_.DriveLetter)" -eq $letter })
+        if ($partitions.Count -or $volumes.Count -or
+            (Get-PSDrive -Name $letter -ErrorAction SilentlyContinue) -or (Test-Path "${letter}:\")) {
+            throw "Drive letter ${letter}: is already in use. Release it before deployment; AutoReset will not unmount existing volumes."
+        }
+    }
+}
+
+function Assert-TargetPartitions {
+    $letters = @('S', 'W', 'R')
+    foreach ($letter in $letters) {
+        $parts = @(Get-Partition -DriveLetter $letter -ErrorAction Stop)
+        if ($parts.Count -ne 1 -or $parts[0].DiskNumber -ne $script:TargetDisk.Number) {
+            throw "Partition ${letter}: does not belong exclusively to the selected disk."
+        }
+        $disk = Get-Disk -Number $parts[0].DiskNumber -ErrorAction Stop
+        if ((Get-DiskIdentity -Disk $disk) -ne $script:TargetIdentity) {
+            throw "Disk identity changed for partition ${letter}:."
+        }
+        $volume = @($parts[0] | Get-Volume -ErrorAction Stop)
+        $expectedFs = if ($letter -eq 'S' -and $script:IsUefi) { 'FAT32' } else { 'NTFS' }
+        if ($volume.Count -ne 1 -or $volume[0].FileSystem -ne $expectedFs -or -not (Test-Path "${letter}:\")) {
+            throw "Partition ${letter}: is unavailable or not formatted as $expectedFs."
+        }
+        if ($letter -eq 'S') {
+            if ($script:IsUefi -and "$($parts[0].GptType)".Trim('{}') -ne 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b') {
+                throw 'S: is not an EFI System Partition.'
+            }
+            if (-not $script:IsUefi -and -not $parts[0].IsActive) { throw 'BIOS system partition is not active.' }
+        }
+        if ($letter -eq 'R') {
+            if ($script:IsUefi -and "$($parts[0].GptType)".Trim('{}') -ne 'de94bba4-06d1-4d40-a16a-bfd50179d6ac') {
+                throw 'R: is not a Windows Recovery partition.'
+            }
+            if (-not $script:IsUefi -and $parts[0].MbrType -ne 39) { throw 'R: has the wrong MBR recovery partition type.' }
+        }
+    }
+}
+
+function Get-DeploymentImage {
+    $relative = Get-Config 'ImageFile' 'Images\install.wim'
+    $path = Resolve-MediaFile $relative
+    if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Image '$relative' was not found." }
+    # Reading the entire file detects unreadable media before destroying the target.
+    $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash
+    $info = Invoke-External -FilePath 'dism.exe' -What 'Image preflight' -Arguments "/English /Get-WimInfo /WimFile:`"$path`""
+    if ($info.ExitCode -ne 0) { throw 'DISM cannot read the installation image.' }
+    $images = @()
+    $currentIndex = $null
+    foreach ($line in ($info.Output -split "[`r`n]+")) {
+        if ($line -match '^\s*Index\s*:\s*(\d+)\s*$') { $currentIndex = [int]$Matches[1] }
+        elseif ($line -match '^\s*Name\s*:\s*(.+)$' -and $null -ne $currentIndex) {
+            $images += [pscustomobject]@{ Index = $currentIndex; Name = $Matches[1].Trim() }
+            $currentIndex = $null
+        }
+    }
+    $index = Get-Config 'ImageIndex' $null
+    $edition = Get-Config 'ImageEdition' 'Windows 11 Enterprise'
+    $selected = @($images | Where-Object { $_.Name -eq $edition -and ($null -eq $index -or $_.Index -eq $index) })
+    if ($selected.Count -ne 1) { throw "Image index/edition '$index / $edition' does not uniquely match an image." }
+    $index = $selected[0].Index
+    $detail = Invoke-External -FilePath 'dism.exe' -What 'Selected image preflight' `
+        -Arguments "/English /Get-WimInfo /WimFile:`"$path`" /Index:$index"
+    if ($detail.ExitCode -ne 0) { throw "Cannot inspect image index $index." }
+    if ($detail.Output -notmatch '(?m)^\s*Size\s*:\s*([0-9,]+)\s+bytes\s*$') {
+        throw 'Cannot determine the expanded image size; refusing to estimate from the compressed file.'
+    }
+    $expandedBytes = [long]($Matches[1] -replace ',', '')
+    if ($expandedBytes -le 0) { throw 'The expanded image size is invalid.' }
+    if ($detail.Output -notmatch '(?m)^\s*Architecture\s*:\s*(x64|arm64)\s*$') {
+        throw 'Only x64 or ARM64 Windows images are supported.'
+    }
+    $architecture = $Matches[1]
+    $hostArchitecture = if ($env:PROCESSOR_ARCHITECTURE -eq 'AMD64') { 'x64' } else { $env:PROCESSOR_ARCHITECTURE }
+    if ($architecture -ne $hostArchitecture) { throw "Image architecture $architecture does not match WinPE $hostArchitecture." }
+    Write-Log "Image preflight: $path | SHA256 $hash | $edition index $index | expanded $expandedBytes bytes"
+    return [pscustomobject]@{
+        Path = $path; Index = $index; Edition = $edition; ExpandedBytes = $expandedBytes
+        Hash = $hash; Architecture = $architecture
+    }
+}
+
+function Assert-ArchiveEntryPath {
+    param([Parameter(Mandatory)][string]$Path)
+    $entryPath = $Path.TrimEnd('\', '/')
+    Assert-RelativePayloadPath $entryPath
+}
+
+function Get-PreparedDrivers {
+    Assert-RelativePayloadPath $script:DriverFolder
+    $archive = $null
+    foreach ($name in @('Drivers.7z', 'Drivers.zip')) {
+        $archive = Resolve-MediaFile "Drivers\$($script:DriverFolder)\$name"
+        if ($archive) { break }
+        $archive = Resolve-MediaFile "Drivers\$name"
+        if ($archive) { break }
+    }
+    $path = $null
+    $required = 0L
+    $hash = $null
+    $tool = $null
+    $modelSubdirectory = $false
+    $infs = @()
+    if ($archive) {
+        $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256 -ErrorAction Stop).Hash
+        $archivePaths = @()
+        if ($archive -match '\.7z$') {
+            $tool = Resolve-MediaFile 'Tools\7za.exe'
+            if (-not $tool -or -not (Test-Path -LiteralPath $tool -PathType Leaf)) {
+                throw '7za.exe is required in Payload\Tools for .7z driver archives.'
+            }
+            $list = Invoke-External -FilePath $tool -What 'Validate driver archive entries' -Arguments "l -slt -pAutoResetNoEncryptedArchives `"$archive`""
+            if ($list.ExitCode -ne 0 -or $list.Output -notmatch '(?m)^----------\s*$') { throw 'Cannot list driver archive entries.' }
+            $entries = ($list.Output -split '(?m)^----------\s*$', 2)[1]
+            $paths = [regex]::Matches($entries, '(?m)^Path = (.+)\r?$')
+            if ($paths.Count -eq 0 -or $entries -match '(?im)^(Symbolic Link|Hard Link) = .+|^Attributes = .*l[rwx-]{9}|^Encrypted = \+') {
+                throw 'Empty/encrypted driver archives and archive links are not supported.'
+            }
+            foreach ($entry in $paths) {
+                $entryPath = $entry.Groups[1].Value.TrimEnd("`r")
+                Assert-ArchiveEntryPath $entryPath
+                $archivePaths += $entryPath -replace '\\', '/'
+            }
+            $sizes = [regex]::Matches($entries, '(?m)^Size = (\d+)\r?$')
+            if ($sizes.Count -ne $paths.Count) { throw 'Driver archive entry sizes are incomplete.' }
+            foreach ($size in $sizes) { $required += [long]$size.Groups[1].Value }
+            $test = Invoke-External -FilePath $tool -What 'Test driver archive' -Arguments "t -pAutoResetNoEncryptedArchives `"$archive`""
+            if ($test.ExitCode -ne 0) { throw 'Driver archive integrity validation failed.' }
+        }
+        else {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+            try {
+                $buffer = New-Object byte[] 65536
+                foreach ($entry in $zip.Entries) {
+                    Assert-ArchiveEntryPath $entry.FullName
+                    if ((($entry.ExternalAttributes -shr 16) -band 0xF000) -eq 0xA000) {
+                        throw 'Symbolic links in driver archives are not supported.'
+                    }
+                    $required += $entry.Length
+                    $archivePaths += $entry.FullName -replace '\\', '/'
+                    $stream = $entry.Open()
+                    try {
+                        $readLength = 0L
+                        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                            $readLength += $read
+                            if ($readLength -gt $entry.Length) { throw "Archive entry '$($entry.FullName)' exceeds its declared size." }
+                        }
+                        if ($readLength -ne $entry.Length) { throw "Archive entry '$($entry.FullName)' is truncated." }
+                    }
+                    finally { $stream.Dispose() }
+                }
+            }
+            finally { $zip.Dispose() }
+        }
+        $prefix = ($script:DriverFolder -replace '\\', '/') + '/'
+        $modelPaths = @($archivePaths | Where-Object { $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
+        $modelSubdirectory = $modelPaths.Count -gt 0
+        $selectedPaths = if ($modelSubdirectory) { $modelPaths } else { $archivePaths }
+        $infs = @($selectedPaths | Where-Object { $_ -match '\.inf$' })
+    }
+    else { $path = Resolve-MediaFile "Drivers\$($script:DriverFolder)" }
+    if ($path) {
+        $files = @(Get-ChildItem -LiteralPath $path -Recurse -Force -ErrorAction Stop)
+        if ($files | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }) {
+            throw 'Driver sources must not contain reparse points.'
+        }
+        $infs = @($files | Where-Object { -not $_.PSIsContainer -and $_.Extension -eq '.inf' })
+        foreach ($file in ($files | Where-Object { -not $_.PSIsContainer })) {
+            $null = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop
+        }
+    }
+    if ($infs.Count -eq 0) {
+        if (Get-Config 'DriversRequired' $false) { throw "Required drivers are missing for '$script:Model'." }
+        Write-Log 'No model drivers available; DriversRequired is false.' 'WARN'
+        $script:StepWarnings += "No drivers injected for $script:Model."
+        return $null
+    }
+    return [pscustomobject]@{
+        Path = $path; Count = $infs.Count; Archive = $archive; Hash = $hash
+        ExpandedBytes = $required; Tool = $tool; ModelSubdirectory = $modelSubdirectory
+    }
+}
+
+function Assert-DriverArchiveUnchanged {
+    param($Drivers)
+    if ($Drivers -and $Drivers.Archive) {
+        if ([string]::IsNullOrWhiteSpace($Drivers.Hash) -or
+            (Get-FileHash -LiteralPath $Drivers.Archive -Algorithm SHA256 -ErrorAction Stop).Hash -ne $Drivers.Hash) {
+            throw 'The selected driver archive changed after validation; refusing to continue.'
+        }
+    }
+}
+
+function Expand-ValidatedDriverArchive {
+    param([Parameter(Mandatory)]$Drivers)
+    Assert-TargetPartitions
+    Assert-DriverArchiveUnchanged -Drivers $Drivers
+    if (-not $Drivers.Archive) { return $Drivers.Path }
+    if ((Get-Volume -DriveLetter W -ErrorAction Stop).SizeRemaining -lt ($Drivers.ExpandedBytes + 1GB)) {
+        throw 'The Windows target volume lacks space for validated driver extraction.'
+    }
+    $destination = 'W:\Windows\Temp\AutoReset-Drivers-' + [guid]::NewGuid().ToString('N')
+    $script:DriverScratch = $destination
+    if ($Drivers.Archive -match '\.7z$') {
+        $extract = Invoke-External -FilePath $Drivers.Tool -What 'Extract validated drivers to target' `
+            -Arguments "x -pAutoResetNoEncryptedArchives `"$($Drivers.Archive)`" -o`"$destination`" -y"
+        if ($extract.ExitCode -ne 0) { throw 'Validated driver archive extraction failed.' }
+    }
+    else {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [IO.Compression.ZipFile]::ExtractToDirectory($Drivers.Archive, $destination)
+    }
+    $files = @(Get-ChildItem -LiteralPath $destination -Recurse -Force -ErrorAction Stop)
+    if ($files | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }) {
+        throw 'Extracted driver sources must not contain reparse points.'
+    }
+    $path = if ($Drivers.ModelSubdirectory) { Join-Path $destination $script:DriverFolder } else { $destination }
+    $infs = @(Get-ChildItem -LiteralPath $path -Recurse -Filter '*.inf' -File -ErrorAction Stop)
+    if ($infs.Count -ne $Drivers.Count) { throw 'Extracted driver package count does not match validated archive contents.' }
+    return $path
+}
+
+function Invoke-DeploymentPreflight {
+    Assert-WinPEEnvironment
+    foreach ($tool in @('diskpart.exe', 'dism.exe', 'bcdboot.exe', 'bcdedit.exe', 'wpeutil.exe')) {
+        if (-not (Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue)) {
+            throw "Required tool '$tool' is unavailable."
+        }
+    }
+    if (-not $script:IsUefi -and -not (Get-Command 'bootsect.exe' -CommandType Application -ErrorAction SilentlyContinue)) {
+        throw 'bootsect.exe is required for Legacy BIOS deployment.'
+    }
+    $script:ProtectedDiskNumbers = @(Get-DeploymentMediaDiskNumbers)
+    $script:TargetDisk = Assert-TargetDiskSafe -DiskNumber $script:TargetDisk.Number `
+        -ExpectedIdentity $script:TargetIdentity -ProtectedDiskNumbers $script:ProtectedDiskNumbers
+    Assert-DeploymentLettersAvailable
+    $image = Get-DeploymentImage
+    $requiredBytes = $image.ExpandedBytes + 10GB + 260MB + 16MB + 2048MB + 4MB
+    if ($script:TargetDisk.Size -lt $requiredBytes) {
+        throw "Target capacity is insufficient: need at least $([math]::Ceiling($requiredBytes / 1GB)) GB for the expanded image, free space and partitions."
+    }
+    if (-not $script:IsUefi -and $script:TargetDisk.Size -gt 2TB) { throw 'Legacy MBR deployment to disks over 2 TB is unsupported.' }
+    $drivers = Get-PreparedDrivers
+    if ($drivers) { $requiredBytes += [long]$drivers.ExpandedBytes }
+    if ($script:TargetDisk.Size -lt $requiredBytes) {
+        throw "Target capacity is insufficient for the expanded Windows image and $([math]::Ceiling($drivers.ExpandedBytes / 1GB)) GB of driver staging."
+    }
+    return [pscustomobject]@{ Image = $image; Drivers = $drivers; RequiredBytes = $requiredBytes }
+}
+
+function Invoke-CheckedTool {
+    param([string]$FilePath, [string]$Arguments, [string]$What)
+    $result = Invoke-External -FilePath $FilePath -Arguments $Arguments -What $What
+    if ($result.ExitCode -ne 0) { throw "$What failed (exit $($result.ExitCode))." }
+    return $result.Output
+}
+
+function Assert-TargetBootConfiguration {
+    Assert-TargetPartitions
+    $store = if ($script:IsUefi) { 'S:\EFI\Microsoft\Boot\BCD' } else { 'S:\Boot\BCD' }
+    if (-not (Test-Path -LiteralPath $store -PathType Leaf)) { throw 'Target BCD store is missing.' }
+    $manager = Invoke-CheckedTool 'bcdedit.exe' "/store $store /enum {bootmgr} /v" 'Inspect target boot manager'
+    $loader = Invoke-CheckedTool 'bcdedit.exe' "/store $store /enum {default} /v" 'Inspect target Windows loader'
+    if ($manager -notmatch '(?m)^\s*device\s+partition=S:\s*$' -or
+        $loader -notmatch '(?m)^\s*device\s+partition=W:\s*$' -or
+        $loader -notmatch '(?m)^\s*osdevice\s+partition=W:\s*$' -or
+        $loader -notmatch '(?m)^\s*systemroot\s+\\Windows\s*$') {
+        throw 'Target BCD does not point to the selected system and Windows partitions (or cannot be verified in this locale).'
+    }
+    $loaderFile = if ($script:IsUefi) { 'winload.efi' } else { 'winload.exe' }
+    if ($loader -notmatch "(?m)^\s*path\s+\\Windows\\system32\\$([regex]::Escape($loaderFile))\s*$" -or
+        -not (Test-Path -LiteralPath "W:\Windows\System32\$loaderFile" -PathType Leaf)) {
+        throw 'Target Windows loader is missing or incorrectly configured.'
+    }
+    if ($script:IsUefi) {
+        if (-not (Test-Path -LiteralPath 'S:\EFI\Microsoft\Boot\bootmgfw.efi' -PathType Leaf)) {
+            throw 'Target EFI boot manager is missing.'
+        }
+        if (-not $script:FirmwareEntry) { throw 'No target-specific UEFI entry was created.' }
+        $firmware = Invoke-CheckedTool 'bcdedit.exe' '/enum firmware /v' 'Read actual firmware entries'
+        $entry = @($firmware -split '(?:\r?\n){2,}' | Where-Object {
+            $_ -match "(?m)^\s*identifier\s+$([regex]::Escape($script:FirmwareEntry))\s*$"
+        })
+        if ($entry.Count -ne 1 -or $entry[0] -notmatch '(?m)^\s*device\s+partition=S:\s*$' -or
+            $entry[0] -notmatch '(?m)^\s*path\s+\\EFI\\Microsoft\\Boot\\bootmgfw\.efi\s*$') {
+            throw 'The actual UEFI firmware entry does not identify the target EFI boot manager.'
+        }
+        $order = Invoke-CheckedTool 'bcdedit.exe' '/enum {fwbootmgr} /v' 'Verify firmware boot order'
+        if ($order -notmatch "(?m)^\s*displayorder\s+$([regex]::Escape($script:FirmwareEntry))\s*$") {
+            throw 'Target UEFI entry is not first in firmware boot order.'
+        }
+    }
+    elseif (-not (Test-Path -LiteralPath 'S:\bootmgr' -PathType Leaf)) { throw 'Legacy boot manager is missing.' }
+}
+
+function Install-RecoveryFirstBootHook {
+    # Specialize runs as SYSTEM and does not depend on an administrator signing in.
+    # Do not silently replace an image's existing unattended setup configuration.
+    foreach ($existing in @('W:\Windows\Panther\unattend.xml', 'W:\Windows\Panther\Unattend\unattend.xml',
+        'W:\Windows\System32\Sysprep\unattend.xml', 'W:\unattend.xml', 'W:\autounattend.xml')) {
+        if (Test-Path -LiteralPath $existing) {
+            throw "Existing answer file '$existing' conflicts with automatic WinRE activation. Integrate recovery setup in the image or disable SetupRecovery."
+        }
+    }
+    $scripts = 'W:\Windows\Setup\Scripts'
+    New-Item -ItemType Directory -Path $scripts -Force | Out-Null
+    $hook = Join-Path $scripts 'AutoReset-EnableWinRE.ps1'
+    Set-Content -LiteralPath $hook -Encoding UTF8 -Value @'
+$ErrorActionPreference = 'Stop'
+$log = Join-Path $env:windir 'Temp\AutoReset-WinRE.log'
+try {
+    $tool = Join-Path $env:windir 'System32\reagentc.exe'
+    & $tool /enable 2>&1 | Out-File -LiteralPath $log -Append
+    if ($LASTEXITCODE -ne 0) { throw 'reagentc /enable failed.' }
+    & $tool /info 2>&1 | Out-File -LiteralPath $log -Append
+    if ($LASTEXITCODE -ne 0) { throw 'reagentc /info failed.' }
+    [xml]$state = Get-Content -LiteralPath (Join-Path $env:windir 'System32\Recovery\ReAgent.xml') -Raw
+    if ($state.WindowsRE.InstallState.state -ne '1' -or
+        [string]::IsNullOrWhiteSpace($state.WindowsRE.WinreBCD.id) -or
+        $state.WindowsRE.WinreBCD.id.Trim('{}') -eq '00000000-0000-0000-0000-000000000000') {
+        throw 'WinRE activation could not be verified in ReAgent.xml.'
+    }
+    'WinRE enabled and registration verified after first boot.' | Out-File -LiteralPath $log -Append
+    exit 0
+}
+catch {
+    "FAILED: $($_.Exception.Message) Run reagentc /enable and reagentc /info as administrator." |
+        Out-File -LiteralPath $log -Append
+    exit 1
+}
+'@
+    $architecture = if ($script:Preflight.Image.Architecture -eq 'x64') { 'amd64' } else { 'arm64' }
+    New-Item -ItemType Directory -Path 'W:\Windows\Panther' -Force | Out-Null
+    $answerFile = 'W:\Windows\Panther\unattend.xml'
+    Set-Content -LiteralPath $answerFile -Encoding UTF8 -Value @"
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="$architecture" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" wcm:action="add">
+          <Order>1</Order>
+          <Description>Enable and verify AutoReset Windows Recovery</Description>
+          <Path>cmd.exe /c powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%WINDIR%\Setup\Scripts\AutoReset-EnableWinRE.ps1"</Path>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+</unattend>
+"@
+    [xml]$answer = Get-Content -LiteralPath $answerFile -Raw
+    if (-not (Test-Path -LiteralPath $hook -PathType Leaf) -or
+        $answer.unattend.settings.component.RunSynchronous.RunSynchronousCommand.Path -notlike '*AutoReset-EnableWinRE.ps1*') {
+        throw 'First-boot WinRE activation hook could not be verified.'
+    }
+    $script:RecoveryStaged = $true
+    $script:StepWarnings += 'WinRE is staged, not yet enabled. First-boot specialize setup will enable it; verify Windows\Temp\AutoReset-WinRE.log after boot.'
 }
 
 # ═════════════════════════════════════════════════════════════════════
@@ -440,6 +841,7 @@ $splashStart = Get-Date
 # ── Splash work: logging, hardware, disks, config ───────────────────
 
 Write-Section "AutoReset v$($script:Version)"
+Write-Log "Running script: $PSCommandPath | SHA256 $((Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash)"
 Write-LogBlock @(
     "Started      : $($script:StartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
     "Log file     : $($script:LogFile)"
@@ -471,6 +873,7 @@ if (-not $script:Serial) {
 }
 
 $peFw = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control' -ErrorAction SilentlyContinue).PEFirmwareType
+if ($peFw -notin @(1, 2)) { throw 'WinPE firmware type is unknown; refusing to select a partition layout.' }
 $script:IsUefi = ($peFw -eq 2)
 
 & powercfg.exe /s 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null | Out-Null
@@ -482,16 +885,13 @@ foreach ($entry in $driverMap) {
 if (-not $script:DriverFolder) { $script:DriverFolder = $script:Model }
 
 $script:AllDisks = @(Get-Disk | Sort-Object Number)
+$script:ProtectedDiskNumbers = @(Get-DeploymentMediaDiskNumbers)
 
 $configured = Get-Config 'TargetDiskNumber' $null
-if ($null -ne $configured -and "$configured" -ne '') {
-    $script:TargetDisk = Get-Disk -Number ([int]$configured)
-    Write-Log ("Target disk pre-configured in reset.json: disk {0}" -f $configured)
-}
-else {
-    $script:TargetDisk = $script:AllDisks |
-        Where-Object { $_.BusType -notin @('USB', 'iSCSI', 'File Backed Virtual') } |
-        Sort-Object Size -Descending | Select-Object -First 1
+$script:TargetDisk = Get-InitialTargetDisk -Disks $script:AllDisks `
+    -ProtectedDiskNumbers $script:ProtectedDiskNumbers -ConfiguredNumber $configured
+if ($script:TargetDisk) {
+    $script:TargetIdentity = Get-DiskIdentity -Disk $script:TargetDisk
 }
 
 $totalMem = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
@@ -537,16 +937,6 @@ $splashForm.Dispose()
 # STAGE 2: CONFIRM DISK SELECTION
 # ═════════════════════════════════════════════════════════════════════
 
-if (-not $script:TargetDisk) {
-    Show-Console
-    [void][System.Windows.Forms.MessageBox]::Show(
-        'No suitable internal drive was found (USB disks are excluded). This computer may need extra storage drivers in WinPE.',
-        (Title 'Error'),
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Error)
-    exit 1
-}
-
 function Show-DiskConfirmation {
     $sizeGB = [math]::Round($script:TargetDisk.Size / 1GB, 1)
     $letter = Get-PrimaryDriveLetter -DiskNumber $script:TargetDisk.Number
@@ -560,7 +950,7 @@ function Show-DiskConfirmation {
     $dlg.Tag.Controls.Add($lblIntro)
 
     $lblDisk             = New-Object System.Windows.Forms.Label
-    $lblDisk.Text        = "    -  $($script:TargetDisk.FriendlyName)  |  $sizeGB GB  |  $letter"
+    $lblDisk.Text        = "Disk $($script:TargetDisk.Number): $($script:TargetDisk.FriendlyName) | $sizeGB GB | $letter`r`nIdentity: $script:TargetIdentity"
     $lblDisk.Font        = UiFont 10 -Bold
     $lblDisk.AutoSize    = $true
     $lblDisk.MaximumSize = New-Object System.Drawing.Size(524, 0)
@@ -662,7 +1052,9 @@ function Show-DiskConfirmation {
 }
 
 function Show-DiskPicker {
-    $dlg = New-BaseForm -TitleSuffix 'Disk Selection' -Width 580
+    $dlg = New-BaseForm -TitleSuffix 'Disk Selection' -Width 800 -MinimumHeight 450
+    $script:AllDisks = @(Get-Disk -ErrorAction Stop | Sort-Object Number)
+    $script:ProtectedDiskNumbers = @(Get-DeploymentMediaDiskNumbers)
 
     $lbl             = New-Object System.Windows.Forms.Label
     $lbl.Text        = 'Please select the drive you would like to install Windows onto!'
@@ -680,26 +1072,18 @@ function Show-DiskPicker {
     [void]$list.Columns.Add('Size (GB)', 100)
     [void]$list.Columns.Add('Drive', 80)
 
-    # Pat - DPI-aware ListView height using font measurement --------
-    #----------------------------------------------------------------
-    $rowHeight    = [System.Windows.Forms.TextRenderer]::MeasureText(
-        'X', (UiFont 9)).Height + 4
-    $headerHeight = $rowHeight + 4
-    $listHeight   = [math]::Max(
-        $headerHeight + 22,
-        $headerHeight + ($script:AllDisks.Count * $rowHeight))
-    $list.Size        = New-Object System.Drawing.Size(544, $listHeight)
-    $list.MinimumSize = New-Object System.Drawing.Size(544, $listHeight)
-    #----------------------------------------------------------------
+    $list.Font = $dlg.Font
+    $list.Width = 760
+    Initialize-DiskList -List $list -RowCount $script:AllDisks.Count
 
     foreach ($d in $script:AllDisks) {
         $sizeGB     = [math]::Round($d.Size / 1GB, 1)
         $letter     = Get-PrimaryDriveLetter -DiskNumber $d.Number
-        $item       = New-Object System.Windows.Forms.ListViewItem($d.FriendlyName)
+        $item       = New-Object System.Windows.Forms.ListViewItem("Disk $($d.Number): $($d.FriendlyName)")
         [void]$item.SubItems.Add("$sizeGB")
         [void]$item.SubItems.Add($letter)
-        $selectable = $d.BusType -notin @('USB', 'iSCSI', 'File Backed Virtual')
-        $item.Tag   = if ($selectable) { $d.Number } else { $null }
+        $selectable = Test-EligibleTargetDisk -Disk $d -ProtectedDiskNumbers $script:ProtectedDiskNumbers
+        $item.Tag   = if ($selectable) { $d } else { $null }
         if (-not $selectable) {
             $item.ForeColor = [System.Drawing.SystemColors]::GrayText
         }
@@ -739,9 +1123,6 @@ function Show-DiskPicker {
         $btnSelect.Enabled = ($list.SelectedItems.Count -gt 0 -and $null -ne $list.SelectedItems[0].Tag)
     }.GetNewClosure())
 
-    $firstSelectable = $list.Items | Where-Object { $null -ne $_.Tag } | Select-Object -First 1
-    if ($firstSelectable) { $firstSelectable.Selected = $true }
-
     $pickerOkTimer          = New-Object System.Windows.Forms.Timer
     $pickerOkTimer.Interval = 50
     $pickerOkTimer.Add_Tick({
@@ -772,16 +1153,26 @@ function Show-DiskPicker {
     $result = $dlg.ShowDialog()
     $chosen = $null
     if ($result -eq [System.Windows.Forms.DialogResult]::OK -and $list.SelectedItems.Count -gt 0) {
-        $chosen = [int]$list.SelectedItems[0].Tag
+        $chosen = $list.SelectedItems[0].Tag
     }
     $pickerOkTimer.Dispose()
     $pickerCancelTimer.Dispose()
     $dlg.Dispose()
     if ($null -eq $chosen) { return $null }
-    return (Get-Disk -Number $chosen)
+    $identity = Get-DiskIdentity -Disk $chosen
+    $script:ProtectedDiskNumbers = @(Get-DeploymentMediaDiskNumbers)
+    return (Assert-TargetDiskSafe -DiskNumber $chosen.Number -ExpectedIdentity $identity `
+        -ProtectedDiskNumbers $script:ProtectedDiskNumbers)
 }
 
 # ── Disk confirmation loop ──────────────────────────────────────────
+
+if (-not $script:TargetDisk) {
+    Write-Log 'Multiple eligible disks detected; explicit selection is required.'
+    $script:TargetDisk = Show-DiskPicker
+    if (-not $script:TargetDisk) { throw 'Disk selection cancelled; no changes were made.' }
+    $script:TargetIdentity = Get-DiskIdentity -Disk $script:TargetDisk
+}
 
 if (Get-Config 'ConfirmBeforeWipe' $true) {
     while ($true) {
@@ -810,11 +1201,7 @@ if (Get-Config 'ConfirmBeforeWipe' $true) {
                 Write-Log "Resolved wipe script: $wipeScript"
 
                 if ($wipeScript) {
-                    $wipeArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Serial "{1}"' -f
-                        $wipeScript, $script:Serial
-                    Write-Log "Launching: powershell.exe $wipeArgs"
-                    Start-Process -FilePath "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" `
-                        -ArgumentList $wipeArgs -Wait
+                    Invoke-KillDiskProcess -ScriptPath $wipeScript -Serial $script:Serial
                     exit 0
                 }
                 else {
@@ -855,6 +1242,7 @@ if (Get-Config 'ConfirmBeforeWipe' $true) {
             exit 1
         }
         $script:TargetDisk = $picked
+        $script:TargetIdentity = Get-DiskIdentity -Disk $picked
     }
 }
 else {
@@ -968,11 +1356,13 @@ function Set-Action {
     $lblStep.Text    = $Text
     $lblStep.Visible = $true
     if (-not $Quiet) { Write-Log $Text }
+    Set-FormSize -Form $form
     Update-Ui
 }
 
 function Set-StepPercent {
     param([double]$Percent)
+    $wasVisible = $pbStep.Visible
     if ($Percent -ge 0) {
         $stepPercent = [int][math]::Min(100, [math]::Round($Percent))
 
@@ -999,6 +1389,7 @@ function Set-StepPercent {
 
         Update-TimeRemaining
     }
+    if ($wasVisible -ne $pbStep.Visible) { Set-FormSize -Form $form }
     Update-Ui
 }
 
@@ -1006,9 +1397,15 @@ function Set-StepPercent {
 
 $steps = @(
     @{
+        Name = 'Preflight'
+        Weight = 7
+        Action = { $script:Preflight = Invoke-DeploymentPreflight }
+    }
+    @{
         Name   = 'Wipe and Partition'
         Weight = 5
         Action = {
+            if (-not $script:Preflight) { throw 'Preflight has not completed; refusing to wipe.' }
             $diskNum = $script:TargetDisk.Number
             if ($script:IsUefi) {
                 $dp = @"
@@ -1020,40 +1417,52 @@ format quick fs=fat32 label=System
 assign letter=S
 create partition msr size=16
 create partition primary
-shrink minimum=1024
+shrink minimum=2048
 format quick fs=ntfs label=Windows
 assign letter=W
 create partition primary
 format quick fs=ntfs label=Recovery
 assign letter=R
-set id=de94bba4-06d1-4d40-a16a-bfd50179d6ac
+set id=de94bba4-06d1-4d40-a16a-bfd50179d6ac override
 gpt attributes=0x8000000000000001
 exit
 "@
-                Write-Log 'Partition layout: GPT (EFI 260 MB, MSR 16 MB, Windows, Recovery 1 GB)'
+                Write-Log 'Partition layout: GPT (EFI 260 MB, MSR 16 MB, Windows, Recovery 2 GB)'
             }
             else {
                 $dp = @"
 select disk $diskNum
 clean
+convert mbr
 create partition primary size=260
 format quick fs=ntfs label=System
 assign letter=S
 active
 create partition primary
+shrink minimum=2048
 format quick fs=ntfs label=Windows
 assign letter=W
+create partition primary
+format quick fs=ntfs label=Recovery
+assign letter=R
+set id=27 override
 exit
 "@
-                Write-Log 'Partition layout: MBR (System 260 MB active, Windows)'
+                Write-Log 'Partition layout: MBR (System 260 MB active, Windows, Recovery 2 GB)'
             }
             $dpFile = Join-Path $logRoot 'autoreset-partition.txt'
             Set-Content -Path $dpFile -Value $dp -Encoding Ascii
 
-            $result = Invoke-External -FilePath 'diskpart.exe' -Arguments "/s $dpFile" -What 'diskpart'
+            Assert-WinPEEnvironment
+            $script:ProtectedDiskNumbers = @(Get-DeploymentMediaDiskNumbers)
+            Assert-DeploymentLettersAvailable
+            Assert-DriverArchiveUnchanged -Drivers $script:Preflight.Drivers
+            $script:TargetDisk = Assert-TargetDiskSafe -DiskNumber $diskNum `
+                -ExpectedIdentity $script:TargetIdentity -ProtectedDiskNumbers $script:ProtectedDiskNumbers
+            $result = Invoke-External -FilePath 'diskpart.exe' -Arguments "/s `"$dpFile`"" -What 'diskpart'
             if ($result.ExitCode -ne 0) { throw "diskpart failed (exit code $($result.ExitCode))." }
-            if (-not (Test-Path 'W:\')) { throw 'Windows partition (W:) not available after partitioning.' }
-            if (-not (Test-Path 'S:\')) { throw 'System partition (S:) not available after partitioning.' }
+            Assert-TargetPartitions
+            $script:PartitionsVerified = $true
             Write-Log 'Disk wiped and partitions created successfully.'
         }
     }
@@ -1061,48 +1470,11 @@ exit
         Name   = 'Installing Windows'
         Weight = 50
         Action = {
-            $imageRel = Get-Config 'ImageFile' 'Images\install.wim'
-            $wim = Resolve-MediaFile $imageRel
-            if (-not $wim) {
-                throw "Image file '$imageRel' not found on the media."
-            }
-            $wimSize = (Get-Item -LiteralPath $wim).Length
-            Write-Log ('Source image : {0}' -f $wim)
-            Write-Log ('Image size   : {0:N2} GB' -f ($wimSize / 1GB))
-
-            $info = Invoke-External -FilePath 'dism.exe' -What 'dism /Get-WimInfo' -Arguments "/Get-WimInfo /WimFile:`"$wim`""
-            if ($info.ExitCode -ne 0) {
-                throw "DISM cannot read the image file (exit $($info.ExitCode))."
-            }
-            $images = @(); $curIndex = $null
-            foreach ($line in ($info.Output -split "[`r`n]+")) {
-                if ($line -match '^\s*Index\s*:\s*(\d+)') { $curIndex = [int]$Matches[1] }
-                elseif ($line -match '^\s*Name\s*:\s*(.+)$' -and $null -ne $curIndex) {
-                    $images += [pscustomobject]@{ ImageIndex = $curIndex; ImageName = $Matches[1].Trim() }
-                    $curIndex = $null
-                }
-            }
-            if ($images.Count -eq 0) { throw "No images found inside $wim." }
-
-            $index   = Get-Config 'ImageIndex' $null
-            $edition = Get-Config 'ImageEdition' 'Windows 11 Enterprise'
-            if ($null -ne $index -and "$index" -ne '') {
-                $index = [int]$index
-            }
-            else {
-                $match = $images | Where-Object { $_.ImageName -eq $edition } | Select-Object -First 1
-                if (-not $match -and $images.Count -eq 1) { $match = $images[0] }
-                if (-not $match) {
-                    throw ("Edition '$edition' not found. Available: " +
-                           (($images | ForEach-Object { "[$($_.ImageIndex)] $($_.ImageName)" }) -join ', '))
-                }
-                $index = $match.ImageIndex
-            }
-            $chosen = ($images | Where-Object { $_.ImageIndex -eq $index } | Select-Object -First 1).ImageName
-            Write-Log ("Edition      : {0} (index {1})" -f $chosen, $index)
-
+            Assert-TargetPartitions
+            $wim = $script:Preflight.Image.Path
+            $index = $script:Preflight.Image.Index
             $result = Invoke-External -FilePath 'dism.exe' -What 'dism /Apply-Image' -ParsePercent -Arguments (
-                "/Apply-Image /ImageFile:`"$wim`" /Index:$index /ApplyDir:W:\")
+                "/Apply-Image /ImageFile:`"$wim`" /Index:$index /ApplyDir:W:\ /CheckIntegrity /Verify")
             if ($result.ExitCode -ne 0) { throw "Applying the image failed (exit $($result.ExitCode))." }
             if (-not (Test-Path 'W:\Windows\System32')) { throw 'Image applied but W:\Windows\System32 is missing.' }
             Write-Log ('Image applied successfully in {0:mm\:ss}.' -f $result.Elapsed)
@@ -1112,77 +1484,25 @@ exit
         Name   = 'Installing Drivers'
         Weight = 20
         Action = {
-            $driverArchive = $null
-            foreach ($archiveName in @('Drivers.7z', 'Drivers.zip')) {
-                $driverArchive = Resolve-MediaFile ("Drivers\$($script:DriverFolder)\$archiveName")
-                if ($driverArchive) { break }
-                $driverArchive = Resolve-MediaFile "Drivers\$archiveName"
-                if ($driverArchive) { break }
-            }
-
-            $driverPath = $null
-            if ($driverArchive) {
-                $driverPath = 'W:\Windows\Temp\AutoReset-Drivers'
-                Remove-Item -LiteralPath $driverPath -Recurse -Force -ErrorAction SilentlyContinue
-                New-Item -ItemType Directory -Path $driverPath -Force | Out-Null
-                Write-Log ("Extracting driver archive: {0}" -f $driverArchive)
-
-                if ($driverArchive -match '\.7z$') {
-                    $sevenZip = Resolve-MediaFile 'Tools\7za.exe'
-                    if (-not $sevenZip) {
-                        $sevenZip = 'X:\Payload\Tools\7za.exe'
-                        if (-not (Test-Path $sevenZip)) {
-                            throw '7za.exe not found. Add it to Payload\Tools to extract .7z driver archives.'
-                        }
-                    }
-                    $r = Invoke-External -FilePath $sevenZip -What '7za extract' -ParsePercent `
-                        -Arguments "x `"$driverArchive`" -o`"$driverPath`" -y"
-                    if ($r.ExitCode -ne 0) { throw "7-Zip extraction failed (exit $($r.ExitCode))." }
-                }
-                else {
-                    Add-Type -AssemblyName System.IO.Compression.FileSystem
-                    [System.IO.Compression.ZipFile]::ExtractToDirectory($driverArchive, $driverPath)
-                }
-
-                $modelPath = Join-Path $driverPath $script:DriverFolder
-                if (Test-Path -LiteralPath $modelPath) { $driverPath = $modelPath }
-            }
-            else {
-                $driverPath = Resolve-MediaFile ("Drivers\" + $script:DriverFolder)
-            }
-
-            if (-not $driverPath -or -not (Test-Path $driverPath)) {
-                Write-Log ("No drivers found for model '{0}'. Continuing without model-specific drivers." -f $script:Model) 'WARN'
-                $script:StepWarnings += "No drivers injected for $($script:Model)."
-                return 'SKIPPED'
-            }
-
-            $infs = @(Get-ChildItem -Path $driverPath -Recurse -Filter *.inf -ErrorAction SilentlyContinue)
-            if ($infs.Count -eq 0) {
-                Write-Log ("Driver folder '{0}' contains no .inf packages." -f $script:DriverFolder) 'WARN'
-                $script:StepWarnings += "No .inf files found in Drivers\$($script:DriverFolder)."
-                return 'SKIPPED'
-            }
-
+            Assert-TargetPartitions
+            if (-not $script:Preflight.Drivers) { return 'SKIPPED' }
+            $driverPath = Expand-ValidatedDriverArchive -Drivers $script:Preflight.Drivers
+            $count = $script:Preflight.Drivers.Count
             Write-Log ("Driver source: {0}" -f $driverPath)
-            Write-Log ("Packages     : {0} .inf file(s)" -f $infs.Count)
+            Write-Log ("Packages     : {0} .inf file(s)" -f $count)
             $r = Invoke-External -FilePath 'dism.exe' -What 'dism /Add-Driver' -ParsePercent -Arguments (
                 "/Image:W:\ /Add-Driver /Driver:`"$driverPath`" /Recurse")
 
             if ($r.ExitCode -eq 0) {
-                $script:DriversAdded = $infs.Count
-                Write-Log ('{0} driver package(s) injected successfully.' -f $infs.Count)
+                $script:DriversAdded = $count
+                Write-Log ('{0} driver package(s) injected successfully.' -f $count)
             }
             else {
-                if (Get-Config 'ContinueOnDriverError' $true) {
+                if ((Get-Config 'ContinueOnDriverError' $false) -and -not (Get-Config 'DriversRequired' $false)) {
                     Write-Log ("Driver injection returned exit code {0}. Some packages may have failed." -f $r.ExitCode) 'WARN'
                     $script:StepWarnings += 'Some drivers failed to install.'
                 }
                 else { throw "Driver injection failed (exit $($r.ExitCode))." }
-            }
-
-            if ($driverArchive -and (Test-Path 'W:\Windows\Temp\AutoReset-Drivers')) {
-                Remove-Item -LiteralPath 'W:\Windows\Temp\AutoReset-Drivers' -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
     }
@@ -1190,54 +1510,55 @@ exit
         Name   = 'Create WinRE Partition'
         Weight = 4
         Action = {
-            if (-not $script:IsUefi) {
-                Write-Log 'Skipped: Legacy BIOS layout does not use a recovery partition.'
-                return 'SKIPPED'
-            }
+            Assert-TargetPartitions
             if (-not (Get-Config 'SetupRecovery' $true)) {
                 Write-Log 'Skipped: SetupRecovery is disabled in reset.json.'
                 return 'SKIPPED'
             }
             $winre = 'W:\Windows\System32\Recovery\Winre.wim'
-            if (-not (Test-Path $winre)) {
-                Write-Log 'Winre.wim not found in the applied image.' 'WARN'
-                return 'SKIPPED'
-            }
-            if (-not (Test-Path 'R:\')) {
-                Write-Log 'Recovery partition (R:) not available.' 'WARN'
-                return 'SKIPPED'
+            if (-not (Test-Path -LiteralPath $winre -PathType Leaf)) { throw 'Requested Winre.wim is absent from the applied image.' }
+            $reagentc = 'W:\Windows\System32\ReAgentc.exe'
+            if (-not (Test-Path -LiteralPath $reagentc -PathType Leaf)) { throw 'The applied image lacks ReAgentc.exe.' }
+            if ((Get-Volume -DriveLetter R -ErrorAction Stop).SizeRemaining -lt ((Get-Item -LiteralPath $winre).Length + 250MB)) {
+                throw 'The recovery image does not fit with the required recovery servicing reserve.'
             }
             New-Item -ItemType Directory -Path 'R:\Recovery\WindowsRE' -Force | Out-Null
             Copy-Item -Path $winre -Destination 'R:\Recovery\WindowsRE\Winre.wim' -Force
+            if ((Get-FileHash -LiteralPath $winre -Algorithm SHA256).Hash -ne
+                (Get-FileHash -LiteralPath 'R:\Recovery\WindowsRE\Winre.wim' -Algorithm SHA256).Hash) {
+                throw 'The staged recovery image failed hash verification.'
+            }
             Write-Log 'Winre.wim copied to R:\Recovery\WindowsRE.'
-            $result = Invoke-External -FilePath 'W:\Windows\System32\ReAgentc.exe' -What 'reagentc' -Arguments (
+            $result = Invoke-External -FilePath $reagentc -What 'reagentc' -Arguments (
                 '/SetREImage /Path R:\Recovery\WindowsRE /Target W:\Windows')
-            if ($result.ExitCode -ne 0) {
-                Write-Log 'ReAgentc registration failed. WinRE will be configured on first boot.' 'WARN'
-                $script:StepWarnings += 'WinRE registration deferred to first boot.'
-            }
-            else {
-                Write-Log 'Recovery environment staged and registered.'
-            }
+            if ($result.ExitCode -ne 0) { throw 'Offline WinRE path registration failed.' }
+            Install-RecoveryFirstBootHook
+            Write-Log 'Recovery image and first-boot activation hook staged. WinRE activation is not verified until Windows boots.'
         }
     }
     @{
         Name   = 'Create Boot Data'
         Weight = 5
         Action = {
+            Assert-TargetPartitions
             if ($script:IsUefi) {
                 $result = Invoke-External -FilePath 'bcdboot.exe' -What 'bcdboot' -Arguments 'W:\Windows /s S: /f UEFI'
                 if ($result.ExitCode -ne 0) { throw "bcdboot failed (exit $($result.ExitCode))." }
-                $result = Invoke-External -FilePath 'bcdedit.exe' `
-                    -What 'bcdedit displayorder' -Arguments '/set {fwbootmgr} displayorder {bootmgr} /addfirst'
-                if ($result.ExitCode -ne 0) { throw 'Could not set Windows Boot Manager as the first UEFI boot entry.' }
-                Write-Log 'UEFI boot configuration created.'
+                # /s populates the target ESP but deliberately does not create an NVRAM entry.
+                $created = Invoke-CheckedTool 'bcdedit.exe' '/create /d "Windows Boot Manager - AutoReset" /application BOOTAPP' 'Create target firmware entry'
+                if ($created -notmatch '\{[0-9a-fA-F-]{36}\}') { throw 'Could not identify the newly created UEFI entry.' }
+                $script:FirmwareEntry = $Matches[0]
+                $null = Invoke-CheckedTool 'bcdedit.exe' "/set $script:FirmwareEntry device partition=S:" 'Set target firmware device'
+                $null = Invoke-CheckedTool 'bcdedit.exe' "/set $script:FirmwareEntry path \EFI\Microsoft\Boot\bootmgfw.efi" 'Set target firmware path'
+                $null = Invoke-CheckedTool 'bcdedit.exe' "/set {fwbootmgr} displayorder $script:FirmwareEntry /addfirst" 'Set target firmware boot order'
             }
             else {
                 $result = Invoke-External -FilePath 'bcdboot.exe' -What 'bcdboot' -Arguments 'W:\Windows /s S: /f BIOS'
                 if ($result.ExitCode -ne 0) { throw "bcdboot failed (exit $($result.ExitCode))." }
+                $null = Invoke-CheckedTool 'bootsect.exe' '/nt60 S: /mbr' 'Write target BIOS boot code'
                 Write-Log 'Legacy BIOS boot configuration created.'
             }
+            Assert-TargetBootConfiguration
         }
     }
     @{
@@ -1245,6 +1566,7 @@ exit
         Weight = 3
         Action = {
             Write-Log 'Running post-installation verification...'
+            Assert-TargetBootConfiguration
             $problems = @()
             if (-not (Test-Path 'W:\Windows\System32\ntoskrnl.exe')) { $problems += 'ntoskrnl.exe missing.' }
             if (-not (Test-Path 'W:\Windows\System32\config\SYSTEM')) { $problems += 'SYSTEM registry hive missing.' }
@@ -1262,7 +1584,10 @@ exit
                 foreach ($p in $problems) { Write-Log "VERIFICATION FAILED: $p" 'ERROR' }
                 throw ('Verification failed: ' + ($problems -join ' | '))
             }
-            Write-Log 'All verification checks passed.'
+            if ((Get-Config 'SetupRecovery' $true) -and -not $script:RecoveryStaged) {
+                throw 'Requested recovery setup has not been staged.'
+            }
+            Write-Log 'Offline file, partition and boot-configuration checks passed. Bootability, OOBE, networking and WinRE activation still require a real Windows boot.'
         }
     }
     @{
@@ -1324,6 +1649,7 @@ Write-Section 'Deployment Started'
 
 $failed     = $false
 $failedStep = $null
+$failedReason = $null
 $stepNumber = 0
 $results    = New-Object System.Collections.Generic.List[object]
 
@@ -1356,6 +1682,7 @@ foreach ($step in $steps) {
     catch {
         $failed     = $true
         $failedStep = $step.Name
+        $failedReason = $_.Exception.Message
         $elapsed    = (Get-Date) - $stepStart
         $results.Add([pscustomobject]@{ Step = $step.Name; State = 'FAILED'; Elapsed = $elapsed })
         Write-Log ("{0} FAILED after {1:mm\:ss}" -f $step.Name, $elapsed) 'ERROR'
@@ -1365,6 +1692,10 @@ foreach ($step in $steps) {
         }
         break
     }
+}
+
+if ($script:DriverScratch -and (Test-Path -LiteralPath $script:DriverScratch)) {
+    Remove-Item -LiteralPath $script:DriverScratch -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # ── Summary ──────────────────────────────────────────────────────────
@@ -1414,7 +1745,7 @@ if (-not $failed) {
         $serial = if ($script:Serial) { $script:Serial } else { 'this device' }
 
         $lblDone             = New-Object System.Windows.Forms.Label
-        $lblDone.Text        = 'AutoReset has now installed a fresh copy of Windows on this device. Please ensure the following:'
+        $lblDone.Text        = "Windows has been installed and offline checks passed. Bootability and OOBE still require a successful Windows boot.$(if ($script:RecoveryStaged) { ' WinRE activation is scheduled for first-boot setup; check Windows\Temp\AutoReset-WinRE.log afterwards.' }) Please ensure the following:"
         $lblDone.AutoSize    = $true
         $lblDone.MaximumSize = New-Object System.Drawing.Size(544, 0)
         $dlg.Tag.Controls.Add($lblDone)
@@ -1427,7 +1758,7 @@ if (-not $failed) {
         $dlg.Tag.Controls.Add($lblChecklist)
 
         $lblRemoveUsb             = New-Object System.Windows.Forms.Label
-        $lblRemoveUsb.Text        = 'To restart the device, remove the USB and click Restart.'
+        $lblRemoveUsb.Text        = 'Remove the deployment USB or eject/disconnect the ISO, then click Restart. If media cannot be detached yet, select the installed Windows disk in the firmware boot menu.'
         $lblRemoveUsb.Font        = UiFont 10 -Bold
         $lblRemoveUsb.ForeColor   = [System.Drawing.Color]::Red
         $lblRemoveUsb.AutoSize    = $true
@@ -1443,11 +1774,11 @@ if (-not $failed) {
         # Pat - AutoSize button -------------------------------------
         #------------------------------------------------------------
         $btnRestart              = New-Object System.Windows.Forms.Button
-        $btnRestart.Text         = 'Remove USB first'
+        $btnRestart.Text         = 'Restart'
         $btnRestart.AutoSize     = $true
         $btnRestart.MinimumSize  = New-Object System.Drawing.Size(132, 32)
         $btnRestart.Padding      = New-Object System.Windows.Forms.Padding(12, 4, 12, 4)
-        $btnRestart.Enabled      = $false
+        $btnRestart.Enabled      = $true
         Set-PrimaryButtonStyle -Button $btnRestart
         #------------------------------------------------------------
 
@@ -1463,32 +1794,11 @@ if (-not $failed) {
         }.GetNewClosure())
         $btnRestart.Add_Click({ $successTimer.Start() }.GetNewClosure())
 
-        $qualifier = if ($script:MediaRoot) { Split-Path -Path ($script:MediaRoot + '\') -Qualifier } else { $null }
-
-        $usbTimer          = New-Object System.Windows.Forms.Timer
-        $usbTimer.Interval = 1000
-        $usbTimer.Add_Tick({
-            $present = $qualifier -and (Test-Path ($qualifier + '\'))
-            if (-not $present) {
-                $btnRestart.Enabled = $true
-                $btnRestart.Text    = 'Restart'
-                $usbTimer.Stop()
-            }
-        }.GetNewClosure())
-
-        if (-not $qualifier -or -not (Test-Path ($qualifier + '\'))) {
-            $btnRestart.Enabled = $true
-            $btnRestart.Text    = 'Restart'
-        }
-        else { $usbTimer.Start() }
-
         # Pat - Set-FormSize before ShowDialog ----------------------
         Set-FormSize -Form $dlg
         #------------------------------------------------------------
         [void]$dlg.ShowDialog()
         $successTimer.Dispose()
-        $usbTimer.Stop()
-        $usbTimer.Dispose()
         $dlg.Dispose()
 
         Write-Log 'User clicked Restart. Rebooting device.'
@@ -1525,7 +1835,7 @@ else {
         [void](Save-DeviceLog -Result 'FAILED')
 
         $lblError             = New-Object System.Windows.Forms.Label
-        $lblError.Text        = "AutoReset has encountered an error $friendly"
+        $lblError.Text        = "AutoReset has encountered an error $friendly`r`n`r`n$failedReason`r`n`r`nRestart does not retry this step. Booting deployment media again starts a new deployment and can wipe the disk again."
         $lblError.AutoSize    = $true
         $lblError.MaximumSize = New-Object System.Drawing.Size(544, 0)
         $dlg.Tag.Controls.Add($lblError)
@@ -1552,13 +1862,6 @@ else {
             $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
         }.GetNewClosure())
 
-        $errorRetryTimer          = New-Object System.Windows.Forms.Timer
-        $errorRetryTimer.Interval = 50
-        $errorRetryTimer.Add_Tick({
-            $errorRetryTimer.Stop()
-            $dlg.DialogResult = [System.Windows.Forms.DialogResult]::Retry
-        }.GetNewClosure())
-
         # Pat - AutoSize buttons ------------------------------------
         #------------------------------------------------------------
         $btnRestart              = New-Object System.Windows.Forms.Button
@@ -1568,22 +1871,8 @@ else {
         $btnRestart.Padding      = New-Object System.Windows.Forms.Padding(12, 4, 12, 4)
         $btnRestart.Add_Click({ $errorRestartTimer.Start() }.GetNewClosure())
 
-        $retryable = $failedStep -in @('Installing Drivers', 'Create WinRE Partition')
-        if ($retryable) {
-            $btnRetry              = New-Object System.Windows.Forms.Button
-            $btnRetry.Text         = 'Try Again'
-            $btnRetry.AutoSize     = $true
-            $btnRetry.MinimumSize  = New-Object System.Drawing.Size(120, 32)
-            $btnRetry.Padding      = New-Object System.Windows.Forms.Padding(12, 4, 12, 4)
-            $btnRetry.Add_Click({ $errorRetryTimer.Start() }.GetNewClosure())
-            Set-PrimaryButtonStyle -Button $btnRetry
-
-            $btnPanel.Controls.Add($btnRestart)
-            $btnPanel.Controls.Add($btnRetry)
-        } else {
-            Set-PrimaryButtonStyle -Button $btnRestart
-            $btnPanel.Controls.Add($btnRestart)
-        }
+        Set-PrimaryButtonStyle -Button $btnRestart
+        $btnPanel.Controls.Add($btnRestart)
         #------------------------------------------------------------
 
         $dlg.Tag.Controls.Add($btnPanel)
@@ -1592,16 +1881,9 @@ else {
         # Pat - Set-FormSize before ShowDialog ----------------------
         Set-FormSize -Form $dlg
         #------------------------------------------------------------
-        $errorResult = $dlg.ShowDialog()
+        [void]$dlg.ShowDialog()
         $errorRestartTimer.Dispose()
-        $errorRetryTimer.Dispose()
         $dlg.Dispose()
-
-        if ($errorResult -eq [System.Windows.Forms.DialogResult]::Retry) {
-            Write-Log 'User chose to retry. Restarting device.'
-            & wpeutil.exe reboot
-            exit 0
-        }
 
         Write-Section 'AutoReset FAILED'
         Write-Log 'User clicked Restart after failure.'
