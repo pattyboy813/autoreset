@@ -1,5 +1,5 @@
-BeforeAll {
-    $source = Join-Path $PSScriptRoot '..\Invoke-AutoReset.ps1'
+﻿BeforeAll {
+    $source = Join-Path $PSScriptRoot '..\usb-scripts\autoreset.ps1'
     $script:ParseErrors = $null
     $script:DeploymentAst = [System.Management.Automation.Language.Parser]::ParseFile(
         $source, [ref]$null, [ref]$script:ParseErrors)
@@ -45,7 +45,7 @@ Describe 'KillDisk child process result' {
         Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
     }
     It 'waits for and verifies the child result' {
-        { Invoke-KillDiskProcess -ScriptPath 'Invoke-KillDisk.ps1' -Serial 'TEST' } | Should -Not -Throw
+        { Invoke-KillDiskProcess -ScriptPath 'killdisk.ps1' -Serial 'TEST' } | Should -Not -Throw
         Should -Invoke Start-Process -Times 1 -ParameterFilter { $Wait -and $PassThru }
         Should -Invoke Write-Log -Times 1 -ParameterFilter { $Message -eq 'KillDisk process exit code: 0' }
     }
@@ -55,7 +55,7 @@ Describe 'KillDisk child process result' {
         param($Code)
         $script:ChildExitCode = $Code
         Mock Start-Process { [pscustomobject]@{ ExitCode = $script:ChildExitCode } }
-        { Invoke-KillDiskProcess -ScriptPath 'Invoke-KillDisk.ps1' -Serial 'TEST' } |
+        { Invoke-KillDiskProcess -ScriptPath 'killdisk.ps1' -Serial 'TEST' } |
             Should -Throw '*KillDisk did not complete successfully*'
     }
 }
@@ -63,8 +63,8 @@ Describe 'KillDisk child process result' {
 Describe 'Deployment structure and shared UI integration' {
     It 'parses without errors' { $script:ParseErrors.Count | Should -Be 0 }
     It 'loads shared helpers relative to its deployed script' {
-        $script:DeploymentSource | Should -Match "\. \(Join-Path \`$PSScriptRoot 'AutoReset.Common.ps1'\)"
-        $script:DeploymentSource | Should -Match "\. \(Join-Path \`$PSScriptRoot 'AutoReset.UI.ps1'\)"
+        $script:DeploymentSource | Should -Match "\. \(Join-Path \`$PSScriptRoot 'autoreset.common.ps1'\)"
+        $script:DeploymentSource | Should -Match "\. \(Join-Path \`$PSScriptRoot 'autoreset.ui.ps1'\)"
     }
     It 'uses shared form and disk-list layout rather than duplicate sizing functions' {
         $script:DeploymentSource | Should -Not -Match 'function (Set-FormSize|UiFont)\s'
@@ -115,7 +115,7 @@ Describe 'AutoReset display branding' {
         }
     }
     It 'keeps the KillDisk child script name and shortcut' {
-        $script:DeploymentSource | Should -Match 'Scripts\\Invoke-KillDisk\.ps1'
+        $script:DeploymentSource | Should -Match 'Scripts\\killdisk\.ps1'
         $script:DeploymentSource | Should -Match 'Ctrl\+Shift\+W'
     }
 }

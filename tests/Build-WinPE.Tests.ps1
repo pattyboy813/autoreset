@@ -1,5 +1,5 @@
-BeforeAll {
-    $script:BuilderPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'Build-WinPE.ps1'
+﻿BeforeAll {
+    $script:BuilderPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'build.ps1'
     $tokens = $null
     $parseErrors = $null
     $script:BuilderAst = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -236,16 +236,16 @@ Describe 'Boot and update capacity' {
 Describe 'Canonical sources and safe payload defaults' {
     BeforeEach {
         $script:Sources = Join-Path $TestDrive 'sources'
-        $script:PayloadSource = Join-Path $TestDrive 'Payload'
-        New-Item -ItemType Directory -Path $script:Sources, (Join-Path $script:PayloadSource 'Config') -Force | Out-Null
-        foreach ($name in @('Invoke-AutoReset.ps1', 'Invoke-KillDisk.ps1', 'AutoReset.Common.ps1', 'AutoReset.UI.ps1')) {
+        $script:PayloadSource = Join-Path $TestDrive 'kit'
+        New-Item -ItemType Directory -Path $script:Sources, $script:PayloadSource -Force | Out-Null
+        foreach ($name in @('autoreset.ps1', 'killdisk.ps1', 'autoreset.common.ps1', 'autoreset.ui.ps1')) {
             Set-Content -LiteralPath (Join-Path $script:Sources $name) -Value "# $name"
         }
-        Set-Content -LiteralPath (Join-Path $script:PayloadSource 'Config/reset.json') -Value '{"ConfirmBeforeWipe":true}'
+        Set-Content -LiteralPath (Join-Path $script:PayloadSource 'reset.json') -Value '{"ConfirmBeforeWipe":true}'
     }
-    It 'requires the four explicit repository-root runtime files' {
+    It 'requires the four explicit usb-scripts runtime files' {
         @(Get-RuntimeSourceFiles -Root $script:Sources).Count | Should -Be 4
-        Remove-Item -LiteralPath (Join-Path $script:Sources 'AutoReset.Common.ps1')
+        Remove-Item -LiteralPath (Join-Path $script:Sources 'autoreset.common.ps1')
         { Get-RuntimeSourceFiles -Root $script:Sources } | Should -Throw '*Required runtime source missing*'
     }
     It 'rejects a missing installation image unless SkipPayload is explicit' {
@@ -254,7 +254,7 @@ Describe 'Canonical sources and safe payload defaults' {
         { Assert-BuildPayload -PayloadSource $script:PayloadSource -InstallImage $missing -BootOnly } | Should -Not -Throw
     }
     It 'rejects invalid configuration even for boot-only builds' {
-        Set-Content -LiteralPath (Join-Path $script:PayloadSource 'Config/reset.json') -Value '{broken'
+        Set-Content -LiteralPath (Join-Path $script:PayloadSource 'reset.json') -Value '{broken'
         { Assert-BuildPayload -PayloadSource $script:PayloadSource -BootOnly } | Should -Throw
     }
     It 'mirrors exactly the runtime files and removes obsolete overrides' {
@@ -270,7 +270,7 @@ Describe 'Canonical sources and safe payload defaults' {
     }
     It 'bundles Unicode runtime sources with a UTF-8 BOM for Windows PowerShell 5.1' {
         Mock Invoke-Robocopy { }
-        $source = Join-Path $script:Sources 'AutoReset.UI.ps1'
+        $source = Join-Path $script:Sources 'autoreset.ui.ps1'
         $text = '$label = "' + [char]0x2192 + '"'
         [IO.File]::WriteAllText($source, $text, [Text.UTF8Encoding]::new($false))
         $dest = Join-Path $TestDrive 'unicode-bundle'
@@ -279,11 +279,11 @@ Describe 'Canonical sources and safe payload defaults' {
             [byte[]]$bytes = [IO.File]::ReadAllBytes($scriptFile.FullName)
             @($bytes[0..2]) | Should -Be @(0xEF, 0xBB, 0xBF)
         }
-        [IO.File]::ReadAllText((Join-Path $dest 'Scripts/AutoReset.UI.ps1')) | Should -Be $text
+        [IO.File]::ReadAllText((Join-Path $dest 'Scripts/autoreset.ui.ps1')) | Should -Be $text
         [IO.File]::ReadAllBytes($source)[0] | Should -Not -Be 0xEF
     }
     It 'does not duplicate an existing runtime BOM' {
-        $source = Join-Path $script:Sources 'AutoReset.UI.ps1'
+        $source = Join-Path $script:Sources 'autoreset.ui.ps1'
         $dest = Join-Path $TestDrive 'bom-script.ps1'
         [IO.File]::WriteAllText($source, "'hello'", [Text.UTF8Encoding]::new($true))
         Copy-RuntimeScript -Source $source -Destination $dest
@@ -309,7 +309,7 @@ Describe 'Canonical sources and safe payload defaults' {
         }
     }
     It 'ships confirmation-first defaults without a preselected target' {
-        $config = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'Payload/Config/reset.json') -Raw | ConvertFrom-Json
+        $config = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'reset.json') -Raw | ConvertFrom-Json
         $config.ConfirmBeforeWipe | Should -BeTrue
         $config.TargetDiskNumber | Should -BeNullOrEmpty
         $config.ContinueOnDriverError | Should -BeFalse
