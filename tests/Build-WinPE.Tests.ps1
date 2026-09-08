@@ -752,6 +752,19 @@ Describe 'Isolated workspace and mount cleanup' {
         catch { Set-ItResult -Skipped -Because 'This host cannot create test symbolic links.'; return }
         { Assert-NoReparsePath -Path $dest -Recurse } | Should -Throw '*Reparse points*'
     }
+    It 'allows non-link reparse points for cloud-filtered directories' {
+        $path = Join-Path $TestDrive 'cloud-filtered'
+        Mock Test-Path { $true } -ParameterFilter { $LiteralPath -eq $path }
+        Mock Get-Item {
+            [pscustomobject]@{
+                FullName   = $path
+                Attributes = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint
+                LinkType   = $null
+                Target     = $null
+            }
+        } -ParameterFilter { $LiteralPath -eq $path }
+        { Assert-NoReparsePath -Path $path } | Should -Not -Throw
+    }
     It 'does not remove a workspace with a live mounted image' {
         $WorkDir = $script:OwnedWorkspace
         $KeepWorkDir = $false
