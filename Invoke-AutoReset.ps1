@@ -132,6 +132,66 @@ function Select-DeploymentMediaRoot {
     return $roots[0]
 }
 
+function Get-DeploymentSourceIdentity {
+    param([Parameter(Mandatory)][string]$MediaRoot)
+    if ($MediaRoot -notmatch '^([A-Za-z]):[\\/]') { throw 'Deployment media must have a local drive letter.' }
+    $letter = $Matches[1]
+    $volumes = @(Get-Volume -DriveLetter $letter -ErrorAction Stop)
+    if ($volumes.Count -ne 1 -or [string]::IsNullOrWhiteSpace($volumes[0].UniqueId)) {
+        throw 'Cannot uniquely identify the deployment source volume.'
+    }
+    $volume = $volumes[0]
+    $logical = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}:'" -f $letter) -ErrorAction Stop)
+    if ($logical.Count -ne 1 -or [string]::IsNullOrWhiteSpace($logical[0].VolumeSerialNumber)) {
+        throw 'Cannot read the deployment source volume serial number.'
+    }
+    $diskIdentities = @()
+    if ($logical[0].DriveType -ne 5) {
+        $partitions = @(Get-Partition -Volume $volume -ErrorAction Stop)
+        $numbers = @($partitions | Select-Object -ExpandProperty DiskNumber -Unique | Sort-Object)
+        if ($numbers.Count -eq 0) { throw 'Cannot map the deployment source volume to its physical disk.' }
+        foreach ($number in $numbers) {
+            $diskIdentities += Get-DiskIdentity -Disk (Get-Disk -Number $number -ErrorAction Stop)
+        }
+    }
+    # Optical/ISO media has no MSFT_Disk mapping; identify the mounted volume, not the optical drive.
+    [ordered]@{
+        Root = $MediaRoot.TrimEnd('\', '/').ToUpperInvariant()
+        Volume = [string]$volume.UniqueId
+        Serial = [string]$logical[0].VolumeSerialNumber
+        Label = [string]$volume.FileSystemLabel
+        Size = [string]$volume.Size
+        FileSystem = [string]$volume.FileSystem
+        DriveType = [string]$logical[0].DriveType
+        Disks = $diskIdentities
+    } | ConvertTo-Json -Compress
+}
+
+function Assert-DeploymentSourceUnchanged {
+    param([Parameter(Mandatory)]$Preflight)
+    if (-not $Preflight.Source -or [string]::IsNullOrWhiteSpace($Preflight.Source.Identity) -or
+        -not $Preflight.Image -or [string]::IsNullOrWhiteSpace($Preflight.Image.Hash)) {
+        throw 'The deployment source/image was not completely validated; refusing to erase.'
+    }
+    $root = Find-MediaRoot
+    if ($root -ne $Preflight.Source.Root -or
+        (Get-DeploymentSourceIdentity -MediaRoot $root) -ne $Preflight.Source.Identity) {
+        throw 'The selected deployment medium was replaced or changed after preflight.'
+    }
+    if (-not (Test-Path -LiteralPath $Preflight.Image.Path -PathType Leaf)) {
+        throw 'The selected Windows image disappeared after preflight.'
+    }
+    if ((Get-FileHash -LiteralPath $Preflight.Image.Path -Algorithm SHA256 -ErrorAction Stop).Hash -ne $Preflight.Image.Hash) {
+        throw 'The selected Windows image changed after preflight.'
+    }
+    # Recheck attachment/identity after the potentially lengthy full image read.
+    $root = Find-MediaRoot
+    if ($root -ne $Preflight.Source.Root -or
+        (Get-DeploymentSourceIdentity -MediaRoot $root) -ne $Preflight.Source.Identity) {
+        throw 'The selected deployment medium changed while verifying the image.'
+    }
+}
+
 $script:MediaRoot        = $null
 $script:ImagePayloadRoot = 'X:\Payload'
 $script:ConfigJson       = $null
@@ -707,6 +767,9 @@ function Invoke-DeploymentPreflight {
     $script:TargetDisk = Assert-TargetDiskSafe -DiskNumber $script:TargetDisk.Number `
         -ExpectedIdentity $script:TargetIdentity -ProtectedDiskNumbers $script:ProtectedDiskNumbers
     Assert-DeploymentLettersAvailable
+    $sourceRoot = Find-MediaRoot
+    if ($sourceRoot -ne $script:MediaRoot) { throw 'The selected deployment source changed before preflight.' }
+    $source = [pscustomobject]@{ Root = $sourceRoot; Identity = (Get-DeploymentSourceIdentity -MediaRoot $sourceRoot) }
     $image = Get-DeploymentImage
     $requiredBytes = $image.ExpandedBytes + 10GB + 260MB + 16MB + 2048MB + 4MB
     if ($script:TargetDisk.Size -lt $requiredBytes) {
@@ -718,7 +781,7 @@ function Invoke-DeploymentPreflight {
     if ($script:TargetDisk.Size -lt $requiredBytes) {
         throw "Target capacity is insufficient for the expanded Windows image and $([math]::Ceiling($drivers.ExpandedBytes / 1GB)) GB of driver staging."
     }
-    return [pscustomobject]@{ Image = $image; Drivers = $drivers; RequiredBytes = $requiredBytes; Bootsect = $bootsect }
+    return [pscustomobject]@{ Image = $image; Source = $source; Drivers = $drivers; RequiredBytes = $requiredBytes; Bootsect = $bootsect }
 }
 
 function Invoke-CheckedTool {
@@ -1474,6 +1537,7 @@ exit
             $script:ProtectedDiskNumbers = @(Get-DeploymentMediaDiskNumbers)
             Assert-DeploymentLettersAvailable
             Assert-DriverArchiveUnchanged -Drivers $script:Preflight.Drivers
+            Assert-DeploymentSourceUnchanged -Preflight $script:Preflight
             $script:TargetDisk = Assert-TargetDiskSafe -DiskNumber $diskNum `
                 -ExpectedIdentity $script:TargetIdentity -ProtectedDiskNumbers $script:ProtectedDiskNumbers
             $result = Invoke-External -FilePath 'diskpart.exe' -Arguments "/s `"$dpFile`"" -What 'diskpart'
@@ -1562,7 +1626,8 @@ exit
                 $result = Invoke-External -FilePath 'bcdboot.exe' -What 'bcdboot' -Arguments 'W:\Windows /s S: /f UEFI'
                 if ($result.ExitCode -ne 0) { throw "bcdboot failed (exit $($result.ExitCode))." }
                 # /s populates the target ESP but deliberately does not create an NVRAM entry.
-                $created = Invoke-CheckedTool 'bcdedit.exe' '/create /d "Windows Boot Manager - AutoReset" /application BOOTAPP' 'Create target firmware entry'
+                # Copy the firmware-class boot manager, then bind it explicitly to the selected ESP.
+                $created = Invoke-CheckedTool 'bcdedit.exe' '/copy {bootmgr} /d "Windows Boot Manager - AutoReset"' 'Create target firmware entry'
                 if ($created -notmatch '\{[0-9a-fA-F-]{36}\}') { throw 'Could not identify the newly created UEFI entry.' }
                 $script:FirmwareEntry = $Matches[0]
                 $null = Invoke-CheckedTool 'bcdedit.exe' "/set $script:FirmwareEntry device partition=S:" 'Set target firmware device'

@@ -11,7 +11,8 @@ BeforeAll {
         'Get-DeploymentImage', 'Assert-ArchiveEntryPath', 'Assert-DriverArchiveUnchanged', 'Expand-ValidatedDriverArchive',
         'Get-PreparedDrivers', 'Invoke-DeploymentPreflight', 'Invoke-CheckedTool',
         'Assert-TargetBootConfiguration', 'Install-RecoveryFirstBootHook', 'Copy-LogsToTarget',
-        'Invoke-KillDiskProcess', 'Select-DeploymentMediaRoot'
+        'Invoke-KillDiskProcess', 'Select-DeploymentMediaRoot', 'Find-MediaRoot',
+        'Get-DeploymentSourceIdentity', 'Assert-DeploymentSourceUnchanged'
     )
     foreach ($definition in $script:DeploymentAst.FindAll({
         param($node)
@@ -31,8 +32,9 @@ BeforeAll {
     function Get-DiskIdentity { param($Disk) }
     function Assert-TargetDiskSafe { param($DiskNumber, $ExpectedIdentity, $ProtectedDiskNumbers) }
     function Get-Disk { param($Number) }
-    function Get-Partition { param($DriveLetter) }
+    function Get-Partition { param($DriveLetter, $Volume) }
     function Get-Volume { param($DriveLetter) }
+    function Get-CimInstance { param($ClassName, $Filter) }
     function Invoke-External { param($FilePath, $Arguments, $What, [switch]$ParsePercent) }
     function Write-Log { param($Message, $Level) }
 }
@@ -246,11 +248,15 @@ Describe 'Preflight failure gates' {
         $script:IsUefi = $true
         $script:TargetIdentity = 'stable-disk'
         $script:TargetDisk = [pscustomobject]@{ Number = [uint32]0; Size = 100GB }
+        $script:MediaRoot = 'D:\Payload'
         Mock Assert-WinPEEnvironment { }
         Mock Get-Command { [pscustomobject]@{ Name = 'available' } }
         Mock Get-DeploymentMediaDiskNumbers { @(3) }
         Mock Assert-TargetDiskSafe { $script:TargetDisk }
         Mock Assert-DeploymentLettersAvailable { }
+        Mock Find-MediaRoot { 'D:\Payload' }
+        Mock Get-DeploymentSourceIdentity { 'source-volume-and-disk' }
+        Mock Resolve-MediaFile { $null }
         Mock Get-DeploymentImage { [pscustomobject]@{ ExpandedBytes = 30GB } }
         Mock Get-PreparedDrivers { [pscustomobject]@{ Path = 'drivers'; Count = 1 } }
         Mock Invoke-External { throw 'Preflight must not run destructive tools.' }
@@ -261,7 +267,10 @@ Describe 'Preflight failure gates' {
         Should -Invoke Get-DeploymentImage -Times 0
     }
     It 'checks all prerequisites without invoking any wipe' {
-        (Invoke-DeploymentPreflight).RequiredBytes | Should -BeGreaterThan 40GB
+        $preflight = Invoke-DeploymentPreflight
+        $preflight.RequiredBytes | Should -BeGreaterThan 40GB
+        $preflight.Source.Root | Should -Be 'D:\Payload'
+        $preflight.Source.Identity | Should -Be 'source-volume-and-disk'
         Should -Invoke Assert-TargetDiskSafe -Times 1 -ParameterFilter {
             $DiskNumber -eq 0 -and $ExpectedIdentity -eq 'stable-disk' -and $ProtectedDiskNumbers -contains 3
         }
@@ -456,6 +465,7 @@ Describe 'Partition ownership and immediate prewipe revalidation' {
         Mock Get-DeploymentMediaDiskNumbers { @(3) }
         Mock Assert-WinPEEnvironment { }
         Mock Assert-DeploymentLettersAvailable { }
+        Mock Assert-DeploymentSourceUnchanged { }
         Mock Assert-TargetDiskSafe { $script:TargetDisk }
         Mock Invoke-External { [pscustomobject]@{ ExitCode = 0 } }
         Mock Assert-TargetPartitions { }
@@ -491,6 +501,127 @@ Describe 'Partition ownership and immediate prewipe revalidation' {
         & $script:DeploymentSteps[1].Action
         Should -Invoke Set-Content -Times 1 -ParameterFilter { $Value -match '(?s)clean\s+convert mbr' }
         Should -Invoke Assert-TargetPartitions -Times 1
+    }
+    It 'keeps target revalidation last after source checks and immediately before diskpart' {
+        $script:GateOrder = [System.Collections.Generic.List[string]]::new()
+        Mock Assert-DeploymentSourceUnchanged { $script:GateOrder.Add('source') }
+        Mock Assert-TargetDiskSafe { $script:GateOrder.Add('target'); $script:TargetDisk }
+        Mock Invoke-External { $script:GateOrder.Add('diskpart'); [pscustomobject]@{ ExitCode = 0 } }
+        & $script:DeploymentSteps[1].Action
+        ($script:GateOrder -join ',') | Should -Be 'source,target,diskpart'
+    }
+}
+
+Describe 'Deployment source medium fingerprint' {
+    BeforeEach {
+        Mock Get-Volume {
+            [pscustomobject]@{ UniqueId = '\\?\Volume{original}'; FileSystemLabel = 'PAYLOAD'; Size = 16GB; FileSystem = 'NTFS' }
+        }
+        Mock Get-CimInstance { [pscustomobject]@{ VolumeSerialNumber = '1234ABCD'; DriveType = 2 } }
+        Mock Get-Partition { [pscustomobject]@{ DiskNumber = [uint32]3 } }
+        Mock Get-Disk { [pscustomobject]@{ Number = [uint32]3 } }
+        Mock Get-DiskIdentity { 'physical-media-identity' }
+    }
+    It 'captures both unique volume and physical disk identities for USB media' {
+        $identity = Get-DeploymentSourceIdentity -MediaRoot 'D:\Payload' | ConvertFrom-Json
+        $identity.Volume | Should -Be '\\?\Volume{original}'
+        $identity.Serial | Should -Be '1234ABCD'
+        $identity.Disks | Should -Contain 'physical-media-identity'
+        Should -Invoke Get-Partition -Times 1 -ParameterFilter { $null -ne $Volume }
+    }
+    It 'handles read-only optical media without requiring a physical-disk mapping or writes' {
+        Mock Get-CimInstance { [pscustomobject]@{ VolumeSerialNumber = 'ABCD1234'; DriveType = 5 } }
+        Mock Get-Partition { throw 'Optical volumes have no MSFT_Disk partition' }
+        Mock Set-Content { throw 'Optical media is read-only' }
+        $identity = Get-DeploymentSourceIdentity -MediaRoot 'D:\Payload' | ConvertFrom-Json
+        $identity.Serial | Should -Be 'ABCD1234'
+        $identity.DriveType | Should -Be '5'
+        $identity.Disks.Count | Should -Be 0
+        Should -Invoke Get-Partition -Times 0
+        Should -Invoke Set-Content -Times 0
+    }
+    It 'rejects a source volume with an unavailable physical mapping' {
+        Mock Get-Partition { @() }
+        { Get-DeploymentSourceIdentity -MediaRoot 'D:\Payload' } | Should -Throw '*Cannot map*'
+    }
+    It 'rejects an unidentified source volume' {
+        Mock Get-Volume { [pscustomobject]@{ UniqueId = '' } }
+        { Get-DeploymentSourceIdentity -MediaRoot 'D:\Payload' } | Should -Throw '*Cannot uniquely identify*'
+    }
+}
+
+Describe 'Source and full image revalidation before wipe without drivers' {
+    BeforeEach {
+        $script:IsUefi = $true
+        $script:TargetDisk = [pscustomobject]@{ Number = [uint32]0; Size = 100GB }
+        $script:TargetIdentity = 'target'
+        $script:Preflight = [pscustomobject]@{
+            Source = [pscustomobject]@{ Root = 'D:\Payload'; Identity = 'original-medium' }
+            Image = [pscustomobject]@{ Path = 'D:\Payload\Images\install.wim'; Hash = 'original-image' }
+            Drivers = $null
+        }
+        $script:CurrentSourceIdentity = 'original-medium'
+        $logRoot = $PSScriptRoot
+        Mock Write-Log { }
+        Mock Set-Content { }
+        Mock Assert-WinPEEnvironment { }
+        Mock Get-DeploymentMediaDiskNumbers { @(3) }
+        Mock Assert-DeploymentLettersAvailable { }
+        Mock Find-MediaRoot { 'D:\Payload' }
+        Mock Get-DeploymentSourceIdentity { $script:CurrentSourceIdentity }
+        Mock Test-Path { $true }
+        Mock Get-FileHash { [pscustomobject]@{ Hash = 'original-image' } }
+        Mock Assert-TargetDiskSafe { $script:TargetDisk }
+        Mock Assert-TargetPartitions { }
+        Mock Invoke-External { [pscustomobject]@{ ExitCode = 0 } }
+    }
+    It 'rechecks the full image hash and source identity even when no drivers are supplied' {
+        & $script:DeploymentSteps[1].Action
+        Should -Invoke Get-FileHash -Times 1 -ParameterFilter {
+            $LiteralPath -eq 'D:\Payload\Images\install.wim' -and $Algorithm -eq 'SHA256'
+        }
+        Should -Invoke Get-DeploymentSourceIdentity -Times 2
+        Should -Invoke Invoke-External -Times 1 -ParameterFilter { $FilePath -eq 'diskpart.exe' }
+    }
+    It 'aborts before erase if the source medium disappears' {
+        Mock Find-MediaRoot { throw 'No ready external deployment medium' }
+        { & $script:DeploymentSteps[1].Action } | Should -Throw '*No ready external deployment medium*'
+        Should -Invoke Invoke-External -Times 0
+        Should -Invoke Assert-TargetDiskSafe -Times 0
+    }
+    It 'aborts before erase if another deployment medium creates source ambiguity' {
+        Mock Find-MediaRoot { throw 'Multiple deployment media' }
+        { & $script:DeploymentSteps[1].Action } | Should -Throw '*Multiple deployment media*'
+        Should -Invoke Invoke-External -Times 0
+    }
+    It 'aborts before erase if the source medium is replaced at the same drive letter' {
+        $script:CurrentSourceIdentity = 'replacement-medium'
+        { & $script:DeploymentSteps[1].Action } | Should -Throw '*medium was replaced or changed*'
+        Should -Invoke Get-FileHash -Times 0
+        Should -Invoke Invoke-External -Times 0
+    }
+    It 'aborts before erase if the selected Windows image disappears' {
+        Mock Test-Path { $false }
+        { & $script:DeploymentSteps[1].Action } | Should -Throw '*Windows image disappeared*'
+        Should -Invoke Invoke-External -Times 0
+    }
+    It 'aborts before erase if the selected image contents change' {
+        Mock Get-FileHash { [pscustomobject]@{ Hash = 'modified-image' } }
+        { & $script:DeploymentSteps[1].Action } | Should -Throw '*Windows image changed*'
+        Should -Invoke Invoke-External -Times 0
+    }
+    It 'aborts before erase if the selected image cannot be read completely' {
+        Mock Get-FileHash { throw 'Image media read error' }
+        { & $script:DeploymentSteps[1].Action } | Should -Throw '*Image media read error*'
+        Should -Invoke Invoke-External -Times 0
+    }
+    It 'rechecks source attachment after the lengthy image hash read' {
+        Mock Get-FileHash {
+            $script:CurrentSourceIdentity = 'replaced-during-hashing'
+            [pscustomobject]@{ Hash = 'original-image' }
+        }
+        { & $script:DeploymentSteps[1].Action } | Should -Throw '*medium changed while verifying*'
+        Should -Invoke Invoke-External -Times 0
     }
 }
 
@@ -575,6 +706,22 @@ Describe 'Target BCD and UEFI verification' {
         { Assert-TargetBootConfiguration } | Should -Not -Throw
         Should -Invoke Invoke-CheckedTool -Times 2 -ParameterFilter { $Arguments -like '/store S:*' }
         Should -Invoke Invoke-CheckedTool -Times 1 -ParameterFilter { $Arguments -eq '/enum firmware /v' }
+    }
+    It 'copies a firmware-class boot manager rather than creating a boot-environment application' {
+        Mock Assert-TargetBootConfiguration { }
+        Mock Invoke-External { [pscustomobject]@{ ExitCode = 0 } }
+        Mock Invoke-CheckedTool {
+            if ($Arguments -like '/copy {bootmgr} *') { '{12345678-1234-1234-1234-123456789abc}' }
+        }
+        $bootStep = $script:DeploymentSteps | Where-Object Name -eq 'Create Boot Data'
+        & $bootStep.Action
+        Should -Invoke Invoke-CheckedTool -Times 1 -ParameterFilter {
+            $FilePath -eq 'bcdedit.exe' -and $Arguments -eq '/copy {bootmgr} /d "Windows Boot Manager - AutoReset"'
+        }
+        Should -Invoke Invoke-CheckedTool -Times 1 -ParameterFilter { $Arguments -match '^/set \{.*\} device partition=S:$' }
+        Should -Invoke Invoke-CheckedTool -Times 1 -ParameterFilter { $Arguments -match '^/set \{.*\} path \\EFI\\Microsoft\\Boot\\bootmgfw.efi$' }
+        Should -Invoke Assert-TargetBootConfiguration -Times 1
+        $script:DeploymentSource | Should -Not -Match '/application BOOTAPP'
     }
     It 'rejects a BCD Windows loader pointing at the deployment environment' {
         Mock Invoke-CheckedTool { "device partition=X:`nosdevice partition=X:" } -ParameterFilter { $Arguments -like '*{default}*' }
