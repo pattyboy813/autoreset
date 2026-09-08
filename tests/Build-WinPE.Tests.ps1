@@ -237,7 +237,7 @@ Describe 'Canonical sources and safe payload defaults' {
     BeforeEach {
         $script:Sources = Join-Path $TestDrive 'sources'
         $script:PayloadSource = Join-Path $TestDrive 'kit'
-        New-Item -ItemType Directory -Path $script:Sources, $script:PayloadSource -Force | Out-Null
+        New-Item -ItemType Directory -Path $script:Sources, $script:PayloadSource, (Join-Path $script:PayloadSource 'tools') -Force | Out-Null
         foreach ($name in @('autoreset.ps1', 'killdisk.ps1', 'autoreset.common.ps1', 'autoreset.ui.ps1')) {
             Set-Content -LiteralPath (Join-Path $script:Sources $name) -Value "# $name"
         }
