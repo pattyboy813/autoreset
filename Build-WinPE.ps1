@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Builds a stripped-down, auto-running WinPE reset USB or ISO.
 
@@ -11,18 +11,30 @@
     AutoReset.Common.ps1 and AutoReset.UI.ps1 next to this builder. These explicit
     files are bundled into boot.wim at Payload\Scripts and mirrored to the
     deployment media's Payload\Scripts; Payload\Scripts is not a source folder.
+    Bundled runtime scripts use UTF-8 with a BOM for Windows PowerShell 5.1.
     Supply configuration at Payload\Config\reset.json. Optional assets live in
     Payload\Images, Payload\Drivers and Payload\Tools. OutputRoot\Images\install.wim
     takes precedence over Payload\Images\install.wim. An image is required unless
     -SkipPayload is explicit. WinPEDrivers is injected for both USB and ISO builds.
+    The default configuration selects Windows 11 Pro by exact edition
+    name, matching the default -PrepareImage edition. ImageIndex defaults to
+    null so multi-index media is supported. If you pin an ImageIndex, it must
+    match ImageEdition; update the configuration for other editions. DriversRequired
+    defaults to false. SetupRecovery installs a first-boot WinRE registration
+    and verification hook and refuses an existing Panther answer file. For
+    custom answer files, integrate equivalent WinRE initialization/verification
+    yourself and set SetupRecovery=false to preserve your answer files.
 
     Driver archives use ZIP unless Payload\Tools\7za.exe is a compatible,
     standalone AMD64 extractor. A supplied incompatible extractor is an error.
+    The trusted ADK AMD64 bootsect.exe is bundled in WinPE Windows\System32
+    (on PATH) and Payload\Tools for legacy BIOS deployment.
     Content hashes invalidate runtime/tool/WIM and driver caches.
     WorkDir is a parent for a unique, builder-owned workspace; existing folders
     and unrelated DISM mounts are never cleaned up. Failed workspaces are retained.
     USB updates require exactly one PE (FAT32) and PAYLOAD (NTFS) volume on the
-    same eligible physical USB disk. Logs are preserved during payload refresh.
+    same eligible physical USB disk and the builder's Payload\UNE-Payload.tag
+    ownership marker. Logs are preserved during payload refresh.
 
 .PARAMETER OutputRoot
     Folder for build files, caches, logs, and the default ISO.
@@ -578,6 +590,20 @@ function Copy-ChangedFile {
     }
 }
 
+function Copy-RuntimeScript {
+    param([string]$Source, [string]$Destination)
+    $text = [IO.File]::ReadAllText($Source, [Text.UTF8Encoding]::new($false, $true))
+    $encoding = [Text.UTF8Encoding]::new($true, $true)
+    [byte[]]$bytes = $encoding.GetPreamble() + $encoding.GetBytes($text)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $expectedHash = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '') }
+    finally { $sha.Dispose() }
+    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -ne $expectedHash) {
+        [IO.File]::WriteAllBytes($Destination, $bytes)
+    }
+}
+
 function Get-RuntimeSourceFiles {
     param([Parameter(Mandatory)][string]$Root)
     foreach ($name in @('Invoke-AutoReset.ps1', 'Invoke-KillDisk.ps1', 'AutoReset.Common.ps1', 'AutoReset.UI.ps1')) {
@@ -589,7 +615,8 @@ function Get-RuntimeSourceFiles {
 }
 
 function Sync-RuntimePayload {
-    param([string]$Destination, [object[]]$RuntimeFiles, [string]$PayloadSource)
+    param([string]$Destination, [object[]]$RuntimeFiles, [string]$PayloadSource,
+        [string]$BootsectSource, [string]$System32Path)
     $scripts = Join-Path $Destination 'Scripts'
     Assert-NoReparsePath -Path $Destination -Recurse
     New-Item -ItemType Directory -Path $scripts -Force | Out-Null
@@ -598,7 +625,7 @@ function Sync-RuntimePayload {
             Remove-Item -LiteralPath $stale.FullName -Recurse -Force -ErrorAction Stop
         }
     }
-    foreach ($file in $RuntimeFiles) { Copy-ChangedFile -Source $file.FullName -Destination (Join-Path $scripts $file.Name) }
+    foreach ($file in $RuntimeFiles) { Copy-RuntimeScript -Source $file.FullName -Destination (Join-Path $scripts $file.Name) }
     foreach ($name in @('Config', 'Tools')) {
         $source = Join-Path $PayloadSource $name
         $dest = Join-Path $Destination $name
@@ -606,6 +633,18 @@ function Sync-RuntimePayload {
             Invoke-Robocopy -Source $source -Dest $dest -Extra @('/MIR') -What "$name runtime sync"
         }
         elseif (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction Stop }
+    }
+    if ($BootsectSource) {
+        $tools = Join-Path $Destination 'Tools'
+        New-Item -ItemType Directory -Path $tools -Force | Out-Null
+        Copy-ChangedFile -Source $BootsectSource -Destination (Join-Path $tools 'bootsect.exe')
+        if ($System32Path) {
+            Assert-NoReparsePath -Path $System32Path
+            if (-not (Test-Path -LiteralPath $System32Path -PathType Container)) {
+                throw "WinPE System32 directory missing: $System32Path"
+            }
+            Copy-ChangedFile -Source $BootsectSource -Destination (Join-Path $System32Path 'bootsect.exe')
+        }
     }
 }
 
@@ -1391,6 +1430,7 @@ $cacheKeyParts = @(
     "src:$((Get-FileHash -LiteralPath $srcWinpeWim -Algorithm SHA256).Hash)",
     "config:$(Get-ContentTreeHash -Path (Join-Path $payloadSrc 'Config'))",
     "tools:$(Get-ContentTreeHash -Path (Join-Path $payloadSrc 'Tools'))",
+    "bootsect:$((Get-FileHash -LiteralPath $bootsect -Algorithm SHA256).Hash)",
     "res:$WinPEResolution",
     "drv:$injectWinpeDrivers",
     "builder:$((Get-FileHash -LiteralPath $MyInvocation.MyCommand.Path -Algorithm SHA256).Hash)"
@@ -1468,7 +1508,8 @@ else {
         Write-StepDone 'Set scratch space to 512 MB'
 
         $imgPayload = Join-Path $mountDir 'Payload'
-        Sync-RuntimePayload -Destination $imgPayload -RuntimeFiles $runtimeFiles -PayloadSource $payloadSrc
+        Sync-RuntimePayload -Destination $imgPayload -RuntimeFiles $runtimeFiles -PayloadSource $payloadSrc `
+            -BootsectSource $bootsect -System32Path (Join-Path $mountDir 'Windows\System32')
         Set-WinPEStartup -System32Path (Join-Path $mountDir 'Windows\System32') -Resolution $WinPEResolution
 
         Start-Step 'Committing WinPE image'
@@ -1493,7 +1534,7 @@ else {
 
 Start-Step 'Syncing runtime payload'
 $mediaPayload = Join-Path $mediaDir 'Payload'
-Sync-RuntimePayload -Destination $mediaPayload -RuntimeFiles $runtimeFiles -PayloadSource $payloadSrc
+Sync-RuntimePayload -Destination $mediaPayload -RuntimeFiles $runtimeFiles -PayloadSource $payloadSrc -BootsectSource $bootsect
 Set-Content -LiteralPath (Join-Path $mediaPayload 'UNE-Payload.tag') -Value 'AutoReset deployment media' -Encoding Ascii
 Write-StepDone 'Synced runtime payload'
 

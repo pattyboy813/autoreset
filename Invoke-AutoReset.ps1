@@ -112,13 +112,24 @@ function Write-LogBlock {
 # ── Media and configuration ─────────────────────────────────────────
 
 function Find-MediaRoot {
-    foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+    Select-DeploymentMediaRoot -Drives @([System.IO.DriveInfo]::GetDrives())
+}
+
+function Select-DeploymentMediaRoot {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Drives)
+    $roots = @()
+    foreach ($drive in $Drives) {
         if (-not $drive.IsReady) { continue }
-        if (Test-Path (Join-Path $drive.Name 'Payload\UNE-Payload.tag')) {
-            return (Join-Path $drive.Name 'Payload').TrimEnd('\')
+        if ($drive.Name.TrimEnd('\', '/') -eq 'X:' -or [string]$drive.DriveType -eq 'Ram') { continue }
+        if (Test-Path -LiteralPath (Join-Path $drive.Name 'Payload\UNE-Payload.tag')) {
+            $roots += (Join-Path $drive.Name 'Payload').TrimEnd('\', '/')
         }
     }
-    return $null
+    if ($roots.Count -eq 0) { throw 'No ready external deployment medium contains Payload\UNE-Payload.tag.' }
+    if ($roots.Count -ne 1) {
+        throw "Multiple deployment media were found: $($roots -join ', '). Detach unused USB media or eject unused ISOs, then restart AutoReset."
+    }
+    return $roots[0]
 }
 
 $script:MediaRoot        = $null
@@ -426,12 +437,12 @@ function Get-PrimaryDriveLetter {
 function Invoke-KillDiskProcess {
     param([Parameter(Mandatory)][string]$ScriptPath, [Parameter(Mandatory)][string]$Serial)
     $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Serial "{1}"' -f $ScriptPath, $Serial
-    Write-Log "Launching secure wipe: powershell.exe $arguments"
+    Write-Log "Launching KillDisk logical zero overwrite: powershell.exe $arguments"
     $process = Start-Process -FilePath "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" `
         -ArgumentList $arguments -Wait -PassThru
-    Write-Log "Secure wipe process exit code: $($process.ExitCode)"
+    Write-Log "KillDisk process exit code: $($process.ExitCode)"
     if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) {
-        throw "Secure wipe did not complete successfully (exit code $($process.ExitCode)). Review the KillDisk log before continuing."
+        throw "KillDisk did not complete successfully (exit code $($process.ExitCode)). Review the KillDisk log before continuing."
     }
 }
 
@@ -510,7 +521,7 @@ function Get-DeploymentImage {
         }
     }
     $index = Get-Config 'ImageIndex' $null
-    $edition = Get-Config 'ImageEdition' 'Windows 11 Enterprise'
+    $edition = Get-Config 'ImageEdition' 'Windows 11 Pro'
     $selected = @($images | Where-Object { $_.Name -eq $edition -and ($null -eq $index -or $_.Index -eq $index) })
     if ($selected.Count -ne 1) { throw "Image index/edition '$index / $edition' does not uniquely match an image." }
     $index = $selected[0].Index
@@ -671,7 +682,8 @@ function Expand-ValidatedDriverArchive {
         throw 'Extracted driver sources must not contain reparse points.'
     }
     $path = if ($Drivers.ModelSubdirectory) { Join-Path $destination $script:DriverFolder } else { $destination }
-    $infs = @(Get-ChildItem -LiteralPath $path -Recurse -Filter '*.inf' -File -ErrorAction Stop)
+    $infs = @(Get-ChildItem -LiteralPath $path -Recurse -Filter '*.inf' -ErrorAction Stop |
+        Where-Object { -not $_.PSIsContainer })
     if ($infs.Count -ne $Drivers.Count) { throw 'Extracted driver package count does not match validated archive contents.' }
     return $path
 }
@@ -683,8 +695,13 @@ function Invoke-DeploymentPreflight {
             throw "Required tool '$tool' is unavailable."
         }
     }
-    if (-not $script:IsUefi -and -not (Get-Command 'bootsect.exe' -CommandType Application -ErrorAction SilentlyContinue)) {
-        throw 'bootsect.exe is required for Legacy BIOS deployment.'
+    $bootsect = $null
+    if (-not $script:IsUefi) {
+        $command = Get-Command 'bootsect.exe' -CommandType Application -ErrorAction SilentlyContinue
+        $bootsect = if ($command) { $command.Source } else { Resolve-MediaFile 'Tools\bootsect.exe' }
+        if (-not $bootsect -or -not (Test-Path -LiteralPath $bootsect -PathType Leaf)) {
+            throw 'bootsect.exe is required on PATH or in Payload\Tools for Legacy BIOS deployment.'
+        }
     }
     $script:ProtectedDiskNumbers = @(Get-DeploymentMediaDiskNumbers)
     $script:TargetDisk = Assert-TargetDiskSafe -DiskNumber $script:TargetDisk.Number `
@@ -701,7 +718,7 @@ function Invoke-DeploymentPreflight {
     if ($script:TargetDisk.Size -lt $requiredBytes) {
         throw "Target capacity is insufficient for the expanded Windows image and $([math]::Ceiling($drivers.ExpandedBytes / 1GB)) GB of driver staging."
     }
-    return [pscustomobject]@{ Image = $image; Drivers = $drivers; RequiredBytes = $requiredBytes }
+    return [pscustomobject]@{ Image = $image; Drivers = $drivers; RequiredBytes = $requiredBytes; Bootsect = $bootsect }
 }
 
 function Invoke-CheckedTool {
@@ -1555,7 +1572,7 @@ exit
             else {
                 $result = Invoke-External -FilePath 'bcdboot.exe' -What 'bcdboot' -Arguments 'W:\Windows /s S: /f BIOS'
                 if ($result.ExitCode -ne 0) { throw "bcdboot failed (exit $($result.ExitCode))." }
-                $null = Invoke-CheckedTool 'bootsect.exe' '/nt60 S: /mbr' 'Write target BIOS boot code'
+                $null = Invoke-CheckedTool $script:Preflight.Bootsect '/nt60 S: /mbr' 'Write target BIOS boot code'
                 Write-Log 'Legacy BIOS boot configuration created.'
             }
             Assert-TargetBootConfiguration
@@ -1695,7 +1712,11 @@ foreach ($step in $steps) {
 }
 
 if ($script:DriverScratch -and (Test-Path -LiteralPath $script:DriverScratch)) {
-    Remove-Item -LiteralPath $script:DriverScratch -Recurse -Force -ErrorAction SilentlyContinue
+    try {
+        Assert-TargetPartitions
+        Remove-Item -LiteralPath $script:DriverScratch -Recurse -Force -ErrorAction Stop
+    }
+    catch { Write-Log "Driver staging cleanup skipped or failed: $($_.Exception.Message)" 'WARN' }
 }
 
 # ── Summary ──────────────────────────────────────────────────────────

@@ -26,7 +26,7 @@ BeforeAll {
 
 Describe 'Builder disk and volume safeguards' {
     BeforeEach {
-        $script:Disk = [pscustomobject]@{ Number = 7; UniqueId = 'usb-7'; SerialNumber = 'serial-7'
+        $script:Disk = [pscustomobject]@{ Number = [uint32]7; UniqueId = 'usb-7'; SerialNumber = 'serial-7'
             BusType = 'USB'; Size = 32GB; Path = 'disk-path-7'; Location = 'port-7'
             IsBoot = $false; IsSystem = $false; IsReadOnly = $false; IsOffline = $false; PartitionStyle = 'GPT' }
         $script:Boot = [pscustomobject]@{ DriveLetter = 'P'; FileSystemLabel = 'PE'; FileSystem = 'FAT32'; SizeRemaining = 4GB }
@@ -34,13 +34,14 @@ Describe 'Builder disk and volume safeguards' {
         Mock Get-Disk { $script:Disk }
         Mock Get-Volume { if ($FileSystemLabel -eq 'PE') { $script:Boot } else { $script:Payload } }
         Mock Get-Partition {
-            [pscustomobject]@{ DiskNumber = 7; PartitionNumber = $(if ($DriveLetter -eq 'P') { 1 } else { 2 })
+            [pscustomobject]@{ DiskNumber = [uint32]7; PartitionNumber = [uint32]$(if ($DriveLetter -eq 'P') { 1 } else { 2 })
                 IsReadOnly = $false; IsBoot = $false; IsSystem = $false }
         }
     }
 
     It 'accepts one eligible USB disk and its two partitions' {
         (Get-ValidatedUsbVolumes).Disk.Number | Should -Be 7
+        $script:Disk.Number | Should -BeOfType ([uint32])
     }
     It 'rejects duplicate <Label> labels' -TestCases @(@{ Label = 'PE' }, @{ Label = 'PAYLOAD' }) {
         param($Label)
@@ -52,7 +53,7 @@ Describe 'Builder disk and volume safeguards' {
         { Get-ValidatedUsbVolumes } | Should -Throw '*exactly one*'
     }
     It 'rejects labels on different physical disks' {
-        Mock Get-Partition { [pscustomobject]@{ DiskNumber = 8; PartitionNumber = 2 } } -ParameterFilter { $DriveLetter -eq 'Q' }
+        Mock Get-Partition { [pscustomobject]@{ DiskNumber = [uint32]8; PartitionNumber = [uint32]2 } } -ParameterFilter { $DriveLetter -eq 'Q' }
         { Get-ValidatedUsbVolumes } | Should -Throw '*same physical*'
     }
     It 'rejects wrong filesystem or missing drive letter' {
@@ -64,7 +65,7 @@ Describe 'Builder disk and volume safeguards' {
     }
     It 'rejects a read-only partition on an otherwise writable disk' {
         Mock Get-Partition {
-            [pscustomobject]@{ DiskNumber = 7; PartitionNumber = 2; IsReadOnly = $true; IsBoot = $false; IsSystem = $false }
+            [pscustomobject]@{ DiskNumber = [uint32]7; PartitionNumber = [uint32]2; IsReadOnly = $true; IsBoot = $false; IsSystem = $false }
         } -ParameterFilter { $DriveLetter -eq 'Q' }
         { Get-ValidatedUsbVolumes } | Should -Throw '*writable*'
     }
@@ -118,7 +119,7 @@ Describe 'Builder disk and volume safeguards' {
         Mock Initialize-Disk { $script:Disk.PartitionStyle = 'MBR' }
         Mock New-Partition {
             $script:PartitionCount++
-            [pscustomobject]@{ DiskNumber = 7; PartitionNumber = $script:PartitionCount }
+            [pscustomobject]@{ DiskNumber = [uint32]7; PartitionNumber = [uint32]$script:PartitionCount }
         }
         Mock Format-Volume { }
         $identity = Get-BuildDiskIdentity $script:Disk
@@ -133,7 +134,7 @@ Describe 'Builder disk and volume safeguards' {
         $script:Disk.PartitionStyle = 'RAW'
         Mock Clear-Disk { throw 'Must not clear a RAW disk' }
         Mock Initialize-Disk { $script:Disk.PartitionStyle = 'MBR' }
-        Mock New-Partition { [pscustomobject]@{ DiskNumber = 7; PartitionNumber = 1 } }
+        Mock New-Partition { [pscustomobject]@{ DiskNumber = [uint32]7; PartitionNumber = [uint32]1 } }
         Mock Format-Volume { }
         $null = New-UsbLayout -DiskNumber 7 -ExpectedIdentity (Get-BuildDiskIdentity $script:Disk) -BootPartitionSize 1GB
         Should -Invoke Clear-Disk -Times 0
@@ -144,11 +145,11 @@ Describe 'Builder disk and volume safeguards' {
         { Assert-BuildPartitionMapping -DiskNumber 8 -PartitionNumber 1 -DriveLetter P } | Should -Throw '*no longer belongs*'
     }
     It 'maps existing ancestors to protected physical disks' {
-        Mock Get-Partition { [pscustomobject]@{ DiskNumber = 4 } } -ParameterFilter { $null -ne $FilePath }
+        Mock Get-Partition { [pscustomobject]@{ DiskNumber = [uint32]4 } } -ParameterFilter { $null -ne $FilePath }
         @(Get-BuildProtectedDiskNumbers -Paths @((Join-Path $TestDrive 'new/output'), $TestDrive)) | Should -Be @(4)
     }
     It 'fails closed when a source path maps to multiple disks' {
-        Mock Get-Partition { [pscustomobject]@{ DiskNumber = 4 }; [pscustomobject]@{ DiskNumber = 5 } } -ParameterFilter { $null -ne $FilePath }
+        Mock Get-Partition { [pscustomobject]@{ DiskNumber = [uint32]4 }; [pscustomobject]@{ DiskNumber = [uint32]5 } } -ParameterFilter { $null -ne $FilePath }
         { Get-BuildProtectedDiskNumbers -Paths @($TestDrive) } | Should -Throw '*unambiguously*'
     }
 }
@@ -179,7 +180,7 @@ Describe 'USB validation reports failure in its own scope' {
 Describe 'Destructive USB mirror ownership' {
     BeforeEach {
         Mock Assert-NoReparsePath { }
-        Mock Join-Path { "$Path/$ChildPath" }
+        Mock Join-Path { "$TestDrive/marker.tag" }
         $script:Volume = [pscustomobject]@{ DriveLetter = 'Q' }
     }
     It 'refuses a label-only disk without the builder marker' {
@@ -267,11 +268,55 @@ Describe 'Canonical sources and safe payload defaults' {
         Test-Path -LiteralPath (Join-Path $dest 'Scripts/stale.ps1') | Should -BeFalse
         Should -Invoke Invoke-Robocopy -Times 1 -ParameterFilter { $Extra -contains '/MIR' }
     }
+    It 'bundles Unicode runtime sources with a UTF-8 BOM for Windows PowerShell 5.1' {
+        Mock Invoke-Robocopy { }
+        $source = Join-Path $script:Sources 'AutoReset.UI.ps1'
+        $text = '$label = "' + [char]0x2192 + '"'
+        [IO.File]::WriteAllText($source, $text, [Text.UTF8Encoding]::new($false))
+        $dest = Join-Path $TestDrive 'unicode-bundle'
+        Sync-RuntimePayload -Destination $dest -RuntimeFiles @(Get-RuntimeSourceFiles -Root $script:Sources) -PayloadSource $script:PayloadSource
+        foreach ($scriptFile in Get-ChildItem -LiteralPath (Join-Path $dest 'Scripts') -File) {
+            [byte[]]$bytes = [IO.File]::ReadAllBytes($scriptFile.FullName)
+            @($bytes[0..2]) | Should -Be @(0xEF, 0xBB, 0xBF)
+        }
+        [IO.File]::ReadAllText((Join-Path $dest 'Scripts/AutoReset.UI.ps1')) | Should -Be $text
+        [IO.File]::ReadAllBytes($source)[0] | Should -Not -Be 0xEF
+    }
+    It 'does not duplicate an existing runtime BOM' {
+        $source = Join-Path $script:Sources 'AutoReset.UI.ps1'
+        $dest = Join-Path $TestDrive 'bom-script.ps1'
+        [IO.File]::WriteAllText($source, "'hello'", [Text.UTF8Encoding]::new($true))
+        Copy-RuntimeScript -Source $source -Destination $dest
+        (Get-FileHash -LiteralPath $dest).Hash | Should -Be (Get-FileHash -LiteralPath $source).Hash
+    }
+    It 'bundles the ADK BIOS deployment tool even without optional payload tools' {
+        Mock Invoke-Robocopy { }
+        $bootsect = Join-Path $TestDrive 'adk-bootsect.exe'
+        [IO.File]::WriteAllText($bootsect, 'ADK tool fixture')
+        foreach ($name in @('wim-runtime', 'media-runtime')) {
+            $dest = Join-Path $TestDrive $name
+            $system32 = $null
+            if ($name -eq 'wim-runtime') {
+                $system32 = Join-Path $TestDrive 'mounted-image/Windows/System32'
+                New-Item -ItemType Directory -Path $system32 -Force | Out-Null
+            }
+            Sync-RuntimePayload -Destination $dest -RuntimeFiles @(Get-RuntimeSourceFiles -Root $script:Sources) `
+                -PayloadSource $script:PayloadSource -BootsectSource $bootsect -System32Path $system32
+            (Get-FileHash -LiteralPath (Join-Path $dest 'Tools/bootsect.exe')).Hash | Should -Be (Get-FileHash -LiteralPath $bootsect).Hash
+            if ($system32) {
+                (Get-FileHash -LiteralPath (Join-Path $system32 'bootsect.exe')).Hash | Should -Be (Get-FileHash -LiteralPath $bootsect).Hash
+            }
+        }
+    }
     It 'ships confirmation-first defaults without a preselected target' {
         $config = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'Payload/Config/reset.json') -Raw | ConvertFrom-Json
         $config.ConfirmBeforeWipe | Should -BeTrue
         $config.TargetDiskNumber | Should -BeNullOrEmpty
         $config.ContinueOnDriverError | Should -BeFalse
+        $config.DriversRequired | Should -BeFalse
+        $editionParameter = $script:BuilderAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Edition' }
+        $config.ImageEdition | Should -Be $editionParameter.DefaultValue.SafeGetValue()
+        $config.ImageIndex | Should -BeNullOrEmpty
     }
 }
 

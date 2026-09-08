@@ -8,10 +8,10 @@ BeforeAll {
     $names = @(
         'Assert-RelativePayloadPath', 'Assert-Configuration', 'Get-Config', 'Resolve-MediaFile',
         'Get-InitialTargetDisk', 'Assert-DeploymentLettersAvailable', 'Assert-TargetPartitions',
-        'Get-DeploymentImage', 'Assert-ArchiveEntryPath', 'Assert-DriverScratchSpace',
+        'Get-DeploymentImage', 'Assert-ArchiveEntryPath', 'Assert-DriverArchiveUnchanged', 'Expand-ValidatedDriverArchive',
         'Get-PreparedDrivers', 'Invoke-DeploymentPreflight', 'Invoke-CheckedTool',
         'Assert-TargetBootConfiguration', 'Install-RecoveryFirstBootHook', 'Copy-LogsToTarget',
-        'Invoke-KillDiskProcess'
+        'Invoke-KillDiskProcess', 'Select-DeploymentMediaRoot'
     )
     foreach ($definition in $script:DeploymentAst.FindAll({
         param($node)
@@ -37,7 +37,7 @@ BeforeAll {
     function Write-Log { param($Message, $Level) }
 }
 
-Describe 'Secure wipe child process result' {
+Describe 'KillDisk child process result' {
     BeforeEach {
         Mock Write-Log { }
         Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
@@ -45,7 +45,7 @@ Describe 'Secure wipe child process result' {
     It 'waits for and verifies the child result' {
         { Invoke-KillDiskProcess -ScriptPath 'Invoke-KillDisk.ps1' -Serial 'TEST' } | Should -Not -Throw
         Should -Invoke Start-Process -Times 1 -ParameterFilter { $Wait -and $PassThru }
-        Should -Invoke Write-Log -Times 1 -ParameterFilter { $Message -eq 'Secure wipe process exit code: 0' }
+        Should -Invoke Write-Log -Times 1 -ParameterFilter { $Message -eq 'KillDisk process exit code: 0' }
     }
     It 'propagates a failed or unavailable child exit code' -TestCases @(
         @{ Code = 1 }, @{ Code = 42 }, @{ Code = $null }
@@ -54,7 +54,7 @@ Describe 'Secure wipe child process result' {
         $script:ChildExitCode = $Code
         Mock Start-Process { [pscustomobject]@{ ExitCode = $script:ChildExitCode } }
         { Invoke-KillDiskProcess -ScriptPath 'Invoke-KillDisk.ps1' -Serial 'TEST' } |
-            Should -Throw '*Secure wipe did not complete successfully*'
+            Should -Throw '*KillDisk did not complete successfully*'
     }
 }
 
@@ -81,6 +81,47 @@ Describe 'Deployment structure and shared UI integration' {
     }
     It 'logs the deployed script path and SHA256' {
         $script:DeploymentSource | Should -Match 'Running script: \$PSCommandPath \| SHA256'
+    }
+}
+
+Describe 'Unambiguous deployment source selection' {
+    BeforeEach {
+        $script:SourceOne = Join-Path $TestDrive 'media-one'
+        $script:SourceTwo = Join-Path $TestDrive 'media-two'
+        Mock Test-Path { $true }
+    }
+    It 'selects exactly one ready external marker root' {
+        $drives = @([pscustomobject]@{ Name = $script:SourceOne; IsReady = $true; DriveType = 'Removable' })
+        Select-DeploymentMediaRoot -Drives $drives | Should -Be (Join-Path $script:SourceOne 'Payload')
+    }
+    It 'rejects multiple deployment sticks or ISO sources instead of picking the first' {
+        $drives = @(
+            [pscustomobject]@{ Name = $script:SourceOne; IsReady = $true; DriveType = 'Removable' },
+            [pscustomobject]@{ Name = $script:SourceTwo; IsReady = $true; DriveType = 'CDRom' }
+        )
+        { Select-DeploymentMediaRoot -Drives $drives } | Should -Throw '*Multiple deployment media*Detach unused*'
+    }
+    It 'ignores the X RAM source even if it contains a baked marker' {
+        $drives = @(
+            [pscustomobject]@{ Name = 'X:\'; IsReady = $true; DriveType = 'Fixed' },
+            [pscustomobject]@{ Name = $script:SourceOne; IsReady = $true; DriveType = 'CDRom' }
+        )
+        Select-DeploymentMediaRoot -Drives $drives | Should -Be (Join-Path $script:SourceOne 'Payload')
+        Should -Invoke Test-Path -Times 1
+    }
+    It 'ignores unreadable drives and RAM disks with other letters' {
+        $drives = @(
+            [pscustomobject]@{ Name = $script:SourceOne; IsReady = $false; DriveType = 'Removable' },
+            [pscustomobject]@{ Name = $script:SourceTwo; IsReady = $true; DriveType = 'Ram' }
+        )
+        { Select-DeploymentMediaRoot -Drives $drives } | Should -Throw '*No ready external deployment medium*'
+        Should -Invoke Test-Path -Times 0
+    }
+    It 'rejects empty inventory or missing marker roots' {
+        { Select-DeploymentMediaRoot -Drives @() } | Should -Throw '*No ready external deployment medium*'
+        Mock Test-Path { $false }
+        $drives = @([pscustomobject]@{ Name = $script:SourceOne; IsReady = $true; DriveType = 'Removable' })
+        { Select-DeploymentMediaRoot -Drives $drives } | Should -Throw '*No ready external deployment medium*'
     }
 }
 
@@ -164,6 +205,16 @@ Describe 'Image preflight' {
         Should -Invoke Invoke-External -Times 2 -ParameterFilter { $Arguments -match '/English /Get-WimInfo' }
         Should -Invoke Get-FileHash -Times 1
     }
+    It 'defaults to the same Windows edition as the image builder' {
+        $script:ConfigJson = $null
+        Mock Invoke-External {
+            if ($Arguments -match '/Index:') {
+                [pscustomobject]@{ ExitCode = 0; Output = "Size : 32,212,254,720 bytes`nArchitecture : x64" }
+            }
+            else { [pscustomobject]@{ ExitCode = 0; Output = "Index : 1`nName : Windows 11 Pro" } }
+        }
+        (Get-DeploymentImage).Edition | Should -Be 'Windows 11 Pro'
+    }
     It 'rejects unreadable image content before DISM or wipe' {
         Mock Get-FileHash { throw 'read error' }
         { Get-DeploymentImage } | Should -Throw '*read error*'
@@ -226,6 +277,11 @@ Describe 'Preflight failure gates' {
         { Invoke-DeploymentPreflight } | Should -Throw '*capacity is insufficient*'
         Should -Invoke Get-PreparedDrivers -Times 0
     }
+    It 'includes expanded driver staging in target capacity before wiping' {
+        Mock Get-PreparedDrivers { [pscustomobject]@{ ExpandedBytes = 80GB; Archive = 'Drivers.7z' } }
+        { Invoke-DeploymentPreflight } | Should -Throw '*driver staging*'
+        Should -Invoke Invoke-External -Times 0
+    }
     It 'rejects media mapping failure' {
         Mock Get-DeploymentMediaDiskNumbers { throw 'Cannot map deployment media' }
         { Invoke-DeploymentPreflight } | Should -Throw '*Cannot map*'
@@ -234,6 +290,13 @@ Describe 'Preflight failure gates' {
         $script:IsUefi = $false
         Mock Get-Command { $null } -ParameterFilter { $Name -eq 'bootsect.exe' }
         { Invoke-DeploymentPreflight } | Should -Throw '*bootsect.exe*required*'
+    }
+    It 'uses the bundled boot-sector tool when WinPE does not expose it on PATH' {
+        $script:IsUefi = $false
+        Mock Get-Command { $null } -ParameterFilter { $Name -eq 'bootsect.exe' }
+        Mock Resolve-MediaFile { 'Payload\Tools\bootsect.exe' } -ParameterFilter { $RelativePath -eq 'Tools\bootsect.exe' }
+        Mock Test-Path { $true }
+        (Invoke-DeploymentPreflight).Bootsect | Should -Be 'Payload\Tools\bootsect.exe'
     }
     It 'propagates driver archive validation failures without wiping' {
         Mock Get-PreparedDrivers { throw 'corrupt archive' }
@@ -251,6 +314,7 @@ Describe 'Driver requirements and archive validation' {
         $logRoot = $PSScriptRoot
         Mock Resolve-MediaFile { $null }
         Mock Write-Log { }
+        Mock Get-FileHash { [pscustomobject]@{ Hash = 'validated-archive' } }
         Mock Invoke-External { [pscustomobject]@{ ExitCode = 1; Output = 'corrupt' } }
     }
     It 'permits missing model drivers only when not required, with a warning' {
@@ -284,7 +348,6 @@ Describe 'Driver requirements and archive validation' {
     It 'tests archive integrity before extraction' {
         Mock Resolve-MediaFile { if ($RelativePath -like '*.7z') { 'Drivers.7z' } else { '7za.exe' } }
         Mock Test-Path { $true }
-        Mock Assert-DriverScratchSpace { }
         Mock Invoke-External {
             if ($Arguments -like 'l *') {
                 [pscustomobject]@{ ExitCode = 0; Output = "Path = Drivers.7z`n`n----------`nPath = driver.inf`nSize = 100`n" }
@@ -294,6 +357,54 @@ Describe 'Driver requirements and archive validation' {
         { Get-PreparedDrivers } | Should -Throw '*integrity validation failed*'
         Should -Invoke Invoke-External -Times 1 -ParameterFilter { $Arguments -like 't *' }
         Should -Invoke Invoke-External -Times 0 -ParameterFilter { $Arguments -like 'x *' }
+    }
+    It 'validates multi-gigabyte driver packs without extracting or requiring WinPE scratch space' {
+        Mock Resolve-MediaFile { if ($RelativePath -like '*.7z') { 'Drivers.7z' } else { '7za.exe' } }
+        Mock Test-Path { $true }
+        Mock Get-PSDrive { throw 'WinPE scratch is only 512 MB' }
+        Mock New-Item { throw 'Preflight must not extract files' }
+        Mock Get-ChildItem { throw 'Preflight must not inspect an extracted folder' }
+        Mock Invoke-External {
+            if ($Arguments -like 'l *') {
+                [pscustomobject]@{ ExitCode = 0; Output = "Path = Drivers.7z`n`n----------`nPath = driver.inf`nSize = 100`n`nPath = large.sys`nSize = 6442450944`n" }
+            }
+            elseif ($Arguments -like 't *') { [pscustomobject]@{ ExitCode = 0; Output = 'Everything is Ok' } }
+            else { throw 'Must not extract before partitioning' }
+        }
+        $drivers = Get-PreparedDrivers
+        $drivers.ExpandedBytes | Should -Be (6GB + 100)
+        $drivers.Hash | Should -Be 'validated-archive'
+        $drivers.Count | Should -Be 1
+        $drivers.Path | Should -BeNullOrEmpty
+        Should -Invoke Get-PSDrive -Times 0
+        Should -Invoke New-Item -Times 0
+        Should -Invoke Invoke-External -Times 0 -ParameterFilter { $Arguments -like 'x *' }
+    }
+    It 'streams ZIP entries for readability and sizes without extracting them' {
+        $script:ZipArchivePath = Join-Path $TestDrive 'Drivers.zip'
+        $zip = [IO.Compression.ZipFile]::Open($script:ZipArchivePath, [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            $entry = $zip.CreateEntry('driver.inf')
+            $stream = $entry.Open()
+            try { $stream.WriteByte(65) } finally { $stream.Dispose() }
+            $entry = $zip.CreateEntry('large.sys')
+            $stream = $entry.Open()
+            try {
+                $buffer = New-Object byte[] 65536
+                for ($i = 0; $i -lt 128; $i++) { $stream.Write($buffer, 0, $buffer.Length) }
+            }
+            finally { $stream.Dispose() }
+        }
+        finally { $zip.Dispose() }
+        Mock Resolve-MediaFile { if ($RelativePath -like '*.zip') { $script:ZipArchivePath } }
+        Mock Get-PSDrive { throw 'No scratch available' }
+        Mock Get-ChildItem { throw 'Must not extract a ZIP during preflight' }
+        $drivers = Get-PreparedDrivers
+        $drivers.Count | Should -Be 1
+        $drivers.ExpandedBytes | Should -Be (8MB + 1)
+        $drivers.Archive | Should -Be $script:ZipArchivePath
+        Should -Invoke Get-ChildItem -Times 0
+        Should -Invoke Get-PSDrive -Times 0
     }
     It 'rejects unsafe archive entry paths' -TestCases @(
         @{ Path = '../escape.inf' }, @{ Path = '/absolute.inf' }, @{ Path = 'C:\escape.inf' },
@@ -369,11 +480,50 @@ Describe 'Partition ownership and immediate prewipe revalidation' {
         { & $script:DeploymentSteps[1].Action } | Should -Throw '*S: in use*'
         Should -Invoke Invoke-External -Times 0
     }
+    It 'rechecks the selected archive hash before any erase command' {
+        $script:Preflight | Add-Member Drivers ([pscustomobject]@{ Archive = 'Drivers.7z'; Hash = 'original' })
+        Mock Get-FileHash { [pscustomobject]@{ Hash = 'changed' } }
+        { & $script:DeploymentSteps[1].Action } | Should -Throw '*driver archive changed*'
+        Should -Invoke Invoke-External -Times 0
+    }
     It 'explicitly converts a GPT source disk to MBR for legacy firmware' {
         $script:IsUefi = $false
         & $script:DeploymentSteps[1].Action
         Should -Invoke Set-Content -Times 1 -ParameterFilter { $Value -match '(?s)clean\s+convert mbr' }
         Should -Invoke Assert-TargetPartitions -Times 1
+    }
+}
+
+Describe 'Post-partition driver extraction' {
+    BeforeEach {
+        $script:Drivers = [pscustomobject]@{
+            Archive = 'Drivers.7z'; Hash = 'original'; ExpandedBytes = 6GB
+            Tool = '7za.exe'; Count = 1; ModelSubdirectory = $false
+        }
+        Mock Assert-TargetPartitions { }
+        Mock Get-FileHash { [pscustomobject]@{ Hash = 'original' } }
+        Mock Get-Volume { [pscustomobject]@{ SizeRemaining = 100GB } }
+        Mock Invoke-External { [pscustomobject]@{ ExitCode = 0 } }
+        Mock Get-ChildItem { [pscustomobject]@{ Attributes = [IO.FileAttributes]::Normal; Extension = '.inf' } }
+    }
+    It 'extracts only into a unique directory on the verified Windows target' {
+        $path = Expand-ValidatedDriverArchive -Drivers $script:Drivers
+        $path | Should -Match '^W:\\Windows\\Temp\\AutoReset-Drivers-[a-f0-9]{32}$'
+        Should -Invoke Assert-TargetPartitions -Times 1
+        Should -Invoke Get-FileHash -Times 1
+        Should -Invoke Invoke-External -Times 1 -ParameterFilter {
+            $Arguments -like 'x *' -and $Arguments -like '*-o"W:\Windows\Temp\AutoReset-Drivers-*'
+        }
+    }
+    It 'rechecks archive identity before extraction' {
+        Mock Get-FileHash { [pscustomobject]@{ Hash = 'changed' } }
+        { Expand-ValidatedDriverArchive -Drivers $script:Drivers } | Should -Throw '*driver archive changed*'
+        Should -Invoke Invoke-External -Times 0
+    }
+    It 'refuses extraction when partition ownership is unverified' {
+        Mock Assert-TargetPartitions { throw 'wrong partition' }
+        { Expand-ValidatedDriverArchive -Drivers $script:Drivers } | Should -Throw '*wrong partition*'
+        Should -Invoke Invoke-External -Times 0
     }
 }
 

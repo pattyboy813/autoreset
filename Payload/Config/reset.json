@@ -2,9 +2,10 @@
   "ConfirmBeforeWipe": true,
   "TargetDiskNumber": null,
   "ImageFile": "Images\\install.wim",
-  "ImageIndex": 1,
-  "ImageEdition": "Windows 11 Enterprise",
+  "ImageIndex": null,
+  "ImageEdition": "Windows 11 Pro",
   "ContinueOnDriverError": false,
+  "DriversRequired": false,
   "SetupRecovery": true,
   "DriverMap": []
 }
