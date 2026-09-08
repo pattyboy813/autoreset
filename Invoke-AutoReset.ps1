@@ -1,11 +1,15 @@
 <#
 .SYNOPSIS
-    AutoReset - Automated Windows deployment tool for WinPE.
+    Respawn - Automated Windows deployment tool for WinPE.
 
 .DESCRIPTION
     Started by winpeshl.ini when WinPE boots. Wipes a disk, applies Windows,
     injects drivers, configures recovery and boot, saves logs, and restarts
     to OOBE ready for Autopilot enrolment.
+
+    Respawn is the display name. Invoke-AutoReset.ps1, shared helper filenames,
+    log paths and recovery hook filenames retain their AutoReset names for
+    compatibility with existing deployment media and support tools.
 
     USB copy of reset.json overrides the configuration baked into boot.wim.
     Press F3 at any time to open the log in Notepad.
@@ -19,13 +23,13 @@ $ErrorActionPreference = 'Stop'
 trap {
     $failure = $_
     try { Show-Console } catch { }
-    try { Write-Log "AutoReset stopped: $($failure.Exception.Message)" 'ERROR' } catch { }
+    try { Write-Log "Respawn stopped: $($failure.Exception.Message)" 'ERROR' } catch { }
     try {
         [void][System.Windows.Forms.MessageBox]::Show(
-            "AutoReset stopped. No further deployment actions will run.`r`n`r`n$($failure.Exception.Message)`r`n`r`nLog: $script:LogFile",
-            'AutoReset error', 'OK', 'Error')
+            "Respawn stopped. No further deployment actions will run.`r`n`r`n$($failure.Exception.Message)`r`n`r`nLog: $script:LogFile",
+            'Respawn error', 'OK', 'Error')
     }
-    catch { Write-Host "AutoReset stopped: $($failure.Exception.Message)" -ForegroundColor Red }
+    catch { Write-Host "Respawn stopped: $($failure.Exception.Message)" -ForegroundColor Red }
     exit 1
 }
 
@@ -64,7 +68,7 @@ $script:DetailLog   = Join-Path $logRoot 'AutoReset-Detail.log'
 $script:SmsTsLogDir = Join-Path $logRoot 'SMSTSLog'
 $script:SmsTsLog    = Join-Path $script:SmsTsLogDir 'smsts.log'
 New-Item -ItemType Directory -Path $script:SmsTsLogDir -Force -ErrorAction SilentlyContinue | Out-Null
-$script:LogComponent = 'AutoReset'
+$script:LogComponent = 'Respawn'
 
 function Write-Log {
     param(
@@ -127,7 +131,7 @@ function Select-DeploymentMediaRoot {
     }
     if ($roots.Count -eq 0) { throw 'No ready external deployment medium contains Payload\UNE-Payload.tag.' }
     if ($roots.Count -ne 1) {
-        throw "Multiple deployment media were found: $($roots -join ', '). Detach unused USB media or eject unused ISOs, then restart AutoReset."
+        throw "Multiple deployment media were found: $($roots -join ', '). Detach unused USB media or eject unused ISOs, then restart Respawn."
     }
     return $roots[0]
 }
@@ -297,7 +301,7 @@ function Set-PrimaryButtonStyle {
 
 function Update-Ui { [System.Windows.Forms.Application]::DoEvents() }
 
-function Title { param([string]$Suffix) "AutoReset v$($script:Version)$(if ($Suffix) { " | $Suffix" })" }
+function Title { param([string]$Suffix) "Respawn $([char]0x2014) Windows Deployment$(if ($Suffix) { " | $Suffix" })" }
 
 # Pat - Dynamic form factory ----------------------------------------
 #   Form is NOT auto-sized. FLP is NOT docked.
@@ -448,7 +452,7 @@ function Save-DeviceLog {
         $duration = (Get-Date) - $script:StartTime
         $header = @(
             '============================================================'
-            "  AutoReset v$($script:Version) - $Result"
+            "  Respawn v$($script:Version) - $Result"
             '============================================================'
             "  Device       : $($script:Manufacturer) $($script:Model)"
             "  Service tag  : $serial"
@@ -527,7 +531,7 @@ function Assert-DeploymentLettersAvailable {
         $volumes = @(Get-Volume -ErrorAction Stop | Where-Object { "$($_.DriveLetter)" -eq $letter })
         if ($partitions.Count -or $volumes.Count -or
             (Get-PSDrive -Name $letter -ErrorAction SilentlyContinue) -or (Test-Path "${letter}:\")) {
-            throw "Drive letter ${letter}: is already in use. Release it before deployment; AutoReset will not unmount existing volumes."
+            throw "Drive letter ${letter}: is already in use. Release it before deployment; Respawn will not unmount existing volumes."
         }
     }
 }
@@ -876,7 +880,7 @@ catch {
       <RunSynchronous>
         <RunSynchronousCommand xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" wcm:action="add">
           <Order>1</Order>
-          <Description>Enable and verify AutoReset Windows Recovery</Description>
+          <Description>Enable and verify Respawn Windows Recovery</Description>
           <Path>cmd.exe /c powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%WINDIR%\Setup\Scripts\AutoReset-EnableWinRE.ps1"</Path>
           <WillReboot>Never</WillReboot>
         </RunSynchronousCommand>
@@ -895,13 +899,13 @@ catch {
 }
 
 # ═════════════════════════════════════════════════════════════════════
-# STAGE 1: SPLASH - Preparing AutoReset (5-second minimum)
+# STAGE 1: SPLASH - Preparing Respawn (5-second minimum)
 # ═════════════════════════════════════════════════════════════════════
 
 $splashForm = New-BaseForm -TitleSuffix 'Preparing...' -Width 480
 
 $lblSplash              = New-Object System.Windows.Forms.Label
-$lblSplash.Text         = 'Preparing AutoReset and gathering info...'
+$lblSplash.Text         = 'Preparing Respawn and gathering info...'
 $lblSplash.Font         = UiFont 10
 $lblSplash.AutoSize     = $true
 $lblSplash.MaximumSize  = New-Object System.Drawing.Size(444, 0)
@@ -920,7 +924,7 @@ $splashStart = Get-Date
 
 # ── Splash work: logging, hardware, disks, config ───────────────────
 
-Write-Section "AutoReset v$($script:Version)"
+Write-Section "Respawn v$($script:Version)"
 Write-Log "Running script: $PSCommandPath | SHA256 $((Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash)"
 Write-LogBlock @(
     "Started      : $($script:StartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
@@ -936,7 +940,7 @@ if (-not $script:MediaRoot) {
     $splashForm.Dispose()
     Show-Console
     [void][System.Windows.Forms.MessageBox]::Show(
-        'AutoReset media not found. Ensure the USB contains Payload\UNE-Payload.tag.',
+        'Respawn media not found. Ensure the USB contains Payload\UNE-Payload.tag.',
         (Title 'Error'),
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error)
@@ -1024,7 +1028,7 @@ function Show-DiskConfirmation {
     $dlg = New-BaseForm -TitleSuffix 'Confirm Disk Selection' -Width 560
 
     $lblIntro             = New-Object System.Windows.Forms.Label
-    $lblIntro.Text        = 'AutoReset has found the following disk to re-install Windows to:'
+    $lblIntro.Text        = 'Respawn has found the following disk to re-install Windows to:'
     $lblIntro.AutoSize    = $true
     $lblIntro.MaximumSize = New-Object System.Drawing.Size(524, 0)
     $dlg.Tag.Controls.Add($lblIntro)
@@ -1627,7 +1631,7 @@ exit
                 if ($result.ExitCode -ne 0) { throw "bcdboot failed (exit $($result.ExitCode))." }
                 # /s populates the target ESP but deliberately does not create an NVRAM entry.
                 # Copy the firmware-class boot manager, then bind it explicitly to the selected ESP.
-                $created = Invoke-CheckedTool 'bcdedit.exe' '/copy {bootmgr} /d "Windows Boot Manager - AutoReset"' 'Create target firmware entry'
+                $created = Invoke-CheckedTool 'bcdedit.exe' '/copy {bootmgr} /d "Windows Boot Manager - Respawn"' 'Create target firmware entry'
                 if ($created -notmatch '\{[0-9a-fA-F-]{36}\}') { throw 'Could not identify the newly created UEFI entry.' }
                 $script:FirmwareEntry = $Matches[0]
                 $null = Invoke-CheckedTool 'bcdedit.exe' "/set $script:FirmwareEntry device partition=S:" 'Set target firmware device'
@@ -1786,7 +1790,7 @@ if ($script:DriverScratch -and (Test-Path -LiteralPath $script:DriverScratch)) {
 
 # ── Summary ──────────────────────────────────────────────────────────
 
-$script:LogComponent = 'AutoReset'
+$script:LogComponent = 'Respawn'
 $totalDuration = (Get-Date) - $script:StartTime
 $outcome = if ($failed) { 'FAILED' } else { 'SUCCESS' }
 
@@ -1824,7 +1828,7 @@ $form.Visible = $false
 
 if (-not $failed) {
     try {
-        Write-Section 'AutoReset completed successfully'
+        Write-Section 'Respawn completed successfully'
 
         $dlg = New-BaseForm -TitleSuffix 'Complete!' -Width 580
 
@@ -1900,7 +1904,7 @@ if (-not $failed) {
             try { Copy-LogsToTarget } catch { }
         } catch { }
         Write-Host ''
-        Write-Host '  AutoReset completed successfully but the completion screen failed.' -ForegroundColor Yellow
+        Write-Host '  Respawn completed successfully but the completion screen failed.' -ForegroundColor Yellow
         Write-Host "  Error: $($_.Exception.Message)" -ForegroundColor Red
         Write-Host "  Line:  $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor Red
         Write-Host ''
@@ -1921,7 +1925,7 @@ else {
         [void](Save-DeviceLog -Result 'FAILED')
 
         $lblError             = New-Object System.Windows.Forms.Label
-        $lblError.Text        = "AutoReset has encountered an error $friendly`r`n`r`n$failedReason`r`n`r`nRestart does not retry this step. Booting deployment media again starts a new deployment and can wipe the disk again."
+        $lblError.Text        = "Respawn has encountered an error $friendly`r`n`r`n$failedReason`r`n`r`nRestart does not retry this step. Booting deployment media again starts a new deployment and can wipe the disk again."
         $lblError.AutoSize    = $true
         $lblError.MaximumSize = New-Object System.Drawing.Size(544, 0)
         $dlg.Tag.Controls.Add($lblError)
@@ -1971,7 +1975,7 @@ else {
         $errorRestartTimer.Dispose()
         $dlg.Dispose()
 
-        Write-Section 'AutoReset FAILED'
+        Write-Section 'Respawn FAILED'
         Write-Log 'User clicked Restart after failure.'
         try { Copy-LogsToTarget } catch { }
         & wpeutil.exe reboot
@@ -1981,7 +1985,7 @@ else {
         Show-Console
         try { Write-Log "Error handler itself failed: $($_.Exception.Message)" 'ERROR' } catch { }
         Write-Host ''
-        Write-Host '  AutoReset FAILED and the error dialog could not be shown.' -ForegroundColor Red
+        Write-Host '  Respawn FAILED and the error dialog could not be shown.' -ForegroundColor Red
         Write-Host "  Error: $($_.Exception.Message)" -ForegroundColor Red
         Write-Host ''
         Write-Host "  Logs: $($script:LogFile)" -ForegroundColor Yellow
@@ -1990,7 +1994,7 @@ else {
         Write-Host '  Type EXIT to reboot, or press F8 to open another command prompt.' -ForegroundColor Gray
         Write-Host ''
         Start-Process -FilePath (Join-Path $env:windir 'System32\cmd.exe') `
-            -ArgumentList '/k echo AutoReset FAILED. Type EXIT to reboot.' -Wait
+            -ArgumentList '/k echo Respawn FAILED. Type EXIT to reboot.' -Wait
         exit 1
     }
 }

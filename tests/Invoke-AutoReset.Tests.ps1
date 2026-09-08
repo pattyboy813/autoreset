@@ -12,7 +12,7 @@ BeforeAll {
         'Get-PreparedDrivers', 'Invoke-DeploymentPreflight', 'Invoke-CheckedTool',
         'Assert-TargetBootConfiguration', 'Install-RecoveryFirstBootHook', 'Copy-LogsToTarget',
         'Invoke-KillDiskProcess', 'Select-DeploymentMediaRoot', 'Find-MediaRoot',
-        'Get-DeploymentSourceIdentity', 'Assert-DeploymentSourceUnchanged'
+        'Get-DeploymentSourceIdentity', 'Assert-DeploymentSourceUnchanged', 'Title'
     )
     foreach ($definition in $script:DeploymentAst.FindAll({
         param($node)
@@ -83,6 +83,40 @@ Describe 'Deployment structure and shared UI integration' {
     }
     It 'logs the deployed script path and SHA256' {
         $script:DeploymentSource | Should -Match 'Running script: \$PSCommandPath \| SHA256'
+    }
+}
+
+Describe 'Respawn display branding' {
+    It 'uses the requested main window title' {
+        Title | Should -Be "Respawn $([char]0x2014) Windows Deployment"
+        Title -Suffix '' | Should -Be "Respawn $([char]0x2014) Windows Deployment"
+    }
+    It 'keeps stage captions under the Respawn window title' -ForEach @(
+        @{ Suffix = 'Preparing...' }, @{ Suffix = 'Disk Selection' },
+        @{ Suffix = 'Complete!' }, @{ Suffix = 'Error' }
+    ) {
+        Title -Suffix $Suffix | Should -Be "Respawn $([char]0x2014) Windows Deployment | $Suffix"
+    }
+    It 'uses Respawn in prompts, failures and completion messages' {
+        foreach ($message in @(
+            'Preparing Respawn and gathering info...',
+            'Respawn has found the following disk to re-install Windows to:',
+            'Respawn media not found.', 'Respawn stopped.', 'Respawn error',
+            'Respawn has encountered an error', 'Respawn completed successfully',
+            'Respawn FAILED'
+        )) {
+            $script:DeploymentSource | Should -Match ([regex]::Escape($message))
+        }
+        $script:DeploymentSource | Should -Not -Match 'AutoReset (v|stopped|error|media not found|has found|has encountered|completed|FAILED)|Preparing AutoReset'
+    }
+    It 'retains legacy log and recovery paths for support compatibility' {
+        foreach ($path in @('AutoReset.log', 'AutoReset-Detail.log', 'AutoReset-EnableWinRE.ps1', 'AutoReset-WinRE.log')) {
+            $script:DeploymentSource | Should -Match ([regex]::Escape($path))
+        }
+    }
+    It 'keeps the KillDisk child script name and shortcut' {
+        $script:DeploymentSource | Should -Match 'Scripts\\Invoke-KillDisk\.ps1'
+        $script:DeploymentSource | Should -Match 'Ctrl\+Shift\+W'
     }
 }
 
@@ -716,7 +750,7 @@ Describe 'Target BCD and UEFI verification' {
         $bootStep = $script:DeploymentSteps | Where-Object Name -eq 'Create Boot Data'
         & $bootStep.Action
         Should -Invoke Invoke-CheckedTool -Times 1 -ParameterFilter {
-            $FilePath -eq 'bcdedit.exe' -and $Arguments -eq '/copy {bootmgr} /d "Windows Boot Manager - AutoReset"'
+            $FilePath -eq 'bcdedit.exe' -and $Arguments -eq '/copy {bootmgr} /d "Windows Boot Manager - Respawn"'
         }
         Should -Invoke Invoke-CheckedTool -Times 1 -ParameterFilter { $Arguments -match '^/set \{.*\} device partition=S:$' }
         Should -Invoke Invoke-CheckedTool -Times 1 -ParameterFilter { $Arguments -match '^/set \{.*\} path \\EFI\\Microsoft\\Boot\\bootmgfw.efi$' }
