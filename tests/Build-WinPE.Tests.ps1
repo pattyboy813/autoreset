@@ -274,6 +274,13 @@ Describe 'Canonical sources and safe payload defaults' {
         Set-Content -LiteralPath (Join-Path $script:PayloadSource 'reset.json') -Value '{broken'
         { Assert-BuildPayload -PayloadSource $script:PayloadSource -BootOnly } | Should -Throw
     }
+    It 'keeps payload-source reparse checks non-recursive during startup preflight' {
+        Mock Assert-NoReparsePath { }
+        Assert-BuildPayload -PayloadSource $script:PayloadSource -BootOnly
+        Should -Invoke Assert-NoReparsePath -Times 1 -ParameterFilter {
+            $Path -eq $script:PayloadSource -and -not $Recurse
+        }
+    }
     It 'mirrors exactly the runtime files and removes obsolete overrides' {
         Mock Invoke-Robocopy { }
         $dest = Join-Path $TestDrive 'destination'

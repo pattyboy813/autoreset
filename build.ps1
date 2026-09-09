@@ -893,7 +893,9 @@ function Assert-BuildPayload {
     param([string]$PayloadSource, [string]$InstallImage, [switch]$BootOnly)
     $config = Join-Path $PayloadSource 'reset.json'
     if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { throw "Required configuration missing: $config" }
-    Assert-NoReparsePath -Path $PayloadSource -Recurse
+    # Startup preflight should stay responsive on large/synced roots.
+    # Deep reparse scans are performed later on concrete copy/hash trees.
+    Assert-NoReparsePath -Path $PayloadSource
     $settings = Get-Content -LiteralPath $config -Raw | ConvertFrom-Json -ErrorAction Stop
     if (-not $settings -or $settings -is [array] -or $settings -isnot [pscustomobject]) {
         throw 'reset.json must contain a configuration object.'
@@ -1706,9 +1708,9 @@ $externalInstallWim = Join-Path $preparedImagesRoot 'install.wim'
 $localInstallWim = Join-Path $payloadSrc 'win-images\install.wim'
 $installWim = if (Test-Path -LiteralPath $externalInstallWim -PathType Leaf) { $externalInstallWim } else { $localInstallWim }
 Assert-BuildPayload -PayloadSource $payloadSrc -InstallImage $installWim -BootOnly:$SkipPayload
-Assert-NoReparsePath -Path $cacheDir -Recurse
-Assert-NoReparsePath -Path $preparedDriversRoot -Recurse
-Assert-NoReparsePath -Path (Join-Path $ScriptRoot 'winpe-drivers') -Recurse
+Assert-NoReparsePath -Path $cacheDir
+Assert-NoReparsePath -Path $preparedDriversRoot
+Assert-NoReparsePath -Path (Join-Path $ScriptRoot 'winpe-drivers')
 $runtimeExtractorPath = Join-Path $payloadSrc 'tools\7za.exe'
 $script:RuntimeExtractor = if (Test-Path -LiteralPath $runtimeExtractorPath -PathType Leaf) {
     Assert-RuntimeExtractor -Path $runtimeExtractorPath
