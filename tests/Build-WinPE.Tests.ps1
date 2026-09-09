@@ -362,6 +362,16 @@ Describe 'Content-based cache and archive refresh' {
         Copy-ChangedFile -Source $script:DriverFile -Destination $dest
         [IO.File]::ReadAllText($dest) | Should -Be 'AAAA'
     }
+    It 'can ignore access-denied copy failures when explicitly requested' {
+        $dest = Join-Path $TestDrive 'protected.inf'
+        [IO.File]::WriteAllText($dest, 'BBBB')
+        Mock Copy-Item { throw ([UnauthorizedAccessException]::new('Access denied')) } -ParameterFilter {
+            $LiteralPath -eq $script:DriverFile -and $Destination -eq $dest
+        }
+        { Copy-ChangedFile -Source $script:DriverFile -Destination $dest -IgnoreAccessDenied } | Should -Not -Throw
+        { Copy-ChangedFile -Source $script:DriverFile -Destination $dest } | Should -Throw '*Access denied*'
+        Should -Invoke Write-BuildLog -Times 1 -ParameterFilter { $Text -like '*Skipping protected file update*' }
+    }
     It 'uses zip without a runtime extractor and excludes old archive formats' {
         [IO.File]::WriteAllText((Join-Path $script:DriverSource 'Drivers.7z'), 'old-source-archive')
         $result = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir

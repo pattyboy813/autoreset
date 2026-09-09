@@ -799,11 +799,18 @@ function Assert-UsbPayloadOwnership {
 }
 
 function Copy-ChangedFile {
-    param([string]$Source, [string]$Destination)
+    param([string]$Source, [string]$Destination, [switch]$IgnoreAccessDenied)
     if (-not (Test-Path -LiteralPath $Destination -PathType Leaf) -or
         (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash -ne
         (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash) {
-        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        try {
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+        }
+        catch {
+            $isAccessDenied = $_.Exception -is [UnauthorizedAccessException] -or $_.Exception.Message -match '(?i)access.*denied'
+            if (-not $IgnoreAccessDenied -or -not $isAccessDenied) { throw }
+            Write-BuildLog "Skipping protected file update (access denied): $Destination"
+        }
     }
 }
 
@@ -870,7 +877,7 @@ function Sync-RuntimePayload {
             if (-not (Test-Path -LiteralPath $System32Path -PathType Container)) {
                 throw "WinPE System32 directory missing: $System32Path"
             }
-            Copy-ChangedFile -Source $BootsectSource -Destination (Join-Path $System32Path 'bootsect.exe')
+            Copy-ChangedFile -Source $BootsectSource -Destination (Join-Path $System32Path 'bootsect.exe') -IgnoreAccessDenied
         }
     }
 }
