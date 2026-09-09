@@ -36,7 +36,8 @@
     Cold builds commit and remount the base once, so may take longer than before.
     USB payload images and driver archives copy directly from their original
     locations, not through the workspace. ISO builds still materialize these files.
-    Unchanged USB files are SHA256-checked and skipped, not blindly rewritten.
+    Repeated builds trust unchanged size+timestamp metadata by default so large
+    WIMs are not reread. Use -FastRefresh:$false for full SHA256 verification.
     WorkDir is a parent for a unique, builder-owned workspace; existing folders
     and unrelated DISM mounts are never cleaned up. Failed workspaces are retained.
     USB updates require exactly one PE (FAT32) and PAYLOAD (NTFS) volume on the
@@ -641,7 +642,7 @@ function Get-CachedFileHash {
         [switch]$TrustMetadata
     )
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-    if (-not $TrustMetadata -or [string]::IsNullOrWhiteSpace($ReceiptDirectory)) {
+    if ([string]::IsNullOrWhiteSpace($ReceiptDirectory)) {
         return (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
     }
 
@@ -651,7 +652,7 @@ function Get-CachedFileHash {
     finally { $sha.Dispose() }
     $receiptPath = Join-Path $ReceiptDirectory $receiptName
 
-    if (Test-Path -LiteralPath $receiptPath -PathType Leaf) {
+    if ($TrustMetadata -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
         try {
             $receipt = Get-Content -LiteralPath $receiptPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             if ($receipt.Version -eq 1 -and [string]$receipt.Path -ceq $item.FullName -and
@@ -665,7 +666,9 @@ function Get-CachedFileHash {
     }
 
     $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
-    New-Item -ItemType Directory -Path $ReceiptDirectory -Force | Out-Null
+    if (-not (Test-Path -LiteralPath $ReceiptDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $ReceiptDirectory -Force | Out-Null
+    }
     $stage = "$receiptPath.$PID.tmp"
     try {
         [pscustomobject]@{

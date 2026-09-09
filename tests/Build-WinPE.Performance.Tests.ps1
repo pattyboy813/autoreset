@@ -56,6 +56,8 @@ Describe 'Independent serviced and customized WinPE caches' {
             Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts |
                 Should -Be ('B' * 64)
             Should -Invoke Get-FileHash -Times 1
+            Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts -TrustMetadata |
+                Should -Be ('B' * 64)
         }
     }
     It 'reuses both keys for identical inputs' {
