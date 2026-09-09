@@ -121,6 +121,14 @@ Describe 'Deployment structure and shared UI integration' {
     It 'logs the deployed script path and SHA256' {
         $script:DeploymentSource | Should -Match 'Running script: \$PSCommandPath \| SHA256'
     }
+    It 'defines console recovery before startup initialization and hides it only afterwards' {
+        $showConsole = $script:DeploymentSource.IndexOf('function Show-Console')
+        $startup = $script:DeploymentSource.IndexOf("Write-BootstrapLog 'Loading WinForms assemblies.'")
+        $hideConsole = $script:DeploymentSource.IndexOf('Hide-Console')
+        $showConsole | Should -BeLessThan $startup
+        $hideConsole | Should -BeGreaterThan $startup
+        $script:DeploymentSource | Should -Match '(?s)catch \{\s*Write-BootstrapLog "Startup initialization failed:.*?Show-Console'
+    }
 }
 
 Describe 'AutoReset display branding' {

@@ -1,4 +1,17 @@
 ﻿# These tests display harmless forms only; they never import a deployment entry point.
+Describe 'WinPE UI startup fallbacks' {
+    BeforeAll {
+        $script:UiSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\usb-scripts\autoreset.ui.ps1') -Raw
+    }
+    It 'treats DPI and visual-style setup as optional' {
+        $script:UiSource | Should -Match 'try \{ \[void\]\[AutoReset\.Display\]::SetProcessDPIAware\(\) \} catch \{ \}'
+        $script:UiSource | Should -Match 'try \{ \[System\.Windows\.Forms\.Application\]::EnableVisualStyles\(\) \} catch \{ \}'
+    }
+    It 'falls back to 100 percent scaling when graphics initialization fails' {
+        $script:UiSource | Should -Match '(?s)\$graphics = \$null.*?catch \{ \$scale = 1\.0 \}.*?finally \{ if \(\$null -ne \$graphics\)'
+    }
+}
+
 Describe 'WinForms disk layout' -Skip:($env:OS -ne 'Windows_NT') {
     BeforeAll {
         . (Join-Path $PSScriptRoot '../usb-scripts/autoreset.ui.ps1')

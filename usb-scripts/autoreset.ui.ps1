@@ -22,8 +22,10 @@ namespace AutoReset {
 }
 '@
 }
-[void][AutoReset.Display]::SetProcessDPIAware()
-[System.Windows.Forms.Application]::EnableVisualStyles()
+# These improve appearance when WinPE's display stack supports them. They are
+# not required for AutoReset to work, so a limited display driver must not stop startup.
+try { [void][AutoReset.Display]::SetProcessDPIAware() } catch { }
+try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch { }
 
 function UiFont {
     param([double]$Size, [switch]$Bold)
@@ -52,9 +54,13 @@ function New-ResetForm {
     $form.AutoScroll = $true
     $form.KeyPreview = $true
 
-    $graphics = $form.CreateGraphics()
-    try { $scale = [math]::Max(1.0, $graphics.DpiX / 96.0) }
-    finally { $graphics.Dispose() }
+    $graphics = $null
+    try {
+        $graphics = $form.CreateGraphics()
+        $scale = [math]::Max(1.0, $graphics.DpiX / 96.0)
+    }
+    catch { $scale = 1.0 }
+    finally { if ($null -ne $graphics) { $graphics.Dispose() } }
     $form | Add-Member -NotePropertyMembers @{
         _UiScale = $scale
         _TargetWidth = [math]::Max(360, $Width)
@@ -105,13 +111,18 @@ function Initialize-DiskList {
     param([Parameter(Mandatory)][System.Windows.Forms.ListView]$List, [int]$RowCount)
     if (-not $List.PSObject.Properties['_RowCount']) { $List.Font = UiFont 10 }
     $List | Add-Member -NotePropertyName '_RowCount' -NotePropertyValue $RowCount -Force
-    $graphics = $List.CreateGraphics()
+    $graphics = $null
     try {
+        $graphics = $List.CreateGraphics()
         $scale = [math]::Max(1.0, $graphics.DpiX / 96.0)
         $rowHeight = [System.Windows.Forms.TextRenderer]::MeasureText(
             $graphics, 'Ag', $List.Font).Height + [int](6 * $scale)
     }
-    finally { $graphics.Dispose() }
+    catch {
+        $scale = 1.0
+        $rowHeight = [System.Windows.Forms.TextRenderer]::MeasureText('Ag', $List.Font).Height + 6
+    }
+    finally { if ($null -ne $graphics) { $graphics.Dispose() } }
     # Reserve several rows even for one disk, including the header, borders and scrollbar.
     $height = ([math]::Max(6, [math]::Min(10, $RowCount)) + 1) * $rowHeight +
         [System.Windows.Forms.SystemInformation]::HorizontalScrollBarHeight +
