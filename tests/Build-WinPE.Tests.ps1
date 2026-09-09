@@ -1025,6 +1025,77 @@ Describe 'Optional WinPE display mode' {
     }
 }
 
+Describe 'Builder help header parsing without entrypoint execution' {
+    It 'starts directly with the help comment, not a BOM retained by raw-text readers' {
+        $bytes = [IO.File]::ReadAllBytes($script:BuilderPath)
+        $bytes[0] | Should -Be 0x3C
+        $bytes[1] | Should -Be 0x23
+    }
+    It 'keeps non-ASCII builder text inside comments for legacy Windows decoding' {
+        $tokens = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:BuilderPath, [ref]$tokens, [ref]$null)
+        @($tokens | Where-Object {
+            $_.Kind -ne 'Comment' -and $_.Text -match '[^\x00-\x7F]'
+        }).Count | Should -Be 0
+    }
+    It 'parses raw <Encoding> bytes with <Ending> without exposing the help text as code' -ForEach @(
+        @{ Encoding = 'UTF-8'; CodePage = 65001; Ending = 'LF'; NewLine = "`n" }
+        @{ Encoding = 'UTF-8'; CodePage = 65001; Ending = 'CRLF'; NewLine = "`r`n" }
+        @{ Encoding = 'Windows-1252'; CodePage = 1252; Ending = 'LF'; NewLine = "`n" }
+        @{ Encoding = 'Windows-1252'; CodePage = 1252; Ending = 'CRLF'; NewLine = "`r`n" }
+    ) {
+        # GetString deliberately does not strip a BOM, unlike ReadAllText/ParseFile.
+        $source = [Text.Encoding]::GetEncoding($CodePage).GetString([IO.File]::ReadAllBytes($script:BuilderPath))
+        $source = $source -replace '\r?\n', $NewLine
+        $errors = $null
+        $tokens = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+        $errors.Count | Should -Be 0
+        $tokens[0].Kind | Should -Be 'Comment'
+        $tokens[0].Text | Should -Match '<LocalAppData>'
+        $tokens[0].Text | Should -Match '<OutputRoot>'
+        $ast.GetHelpContent().Synopsis | Should -Match 'AutoReset and KillDisk'
+        $bindingOnly = [scriptblock]::Create(
+            $source.Substring(0, $ast.ParamBlock.Extent.EndOffset) +
+            "`n`$PSCmdlet.ParameterSetName")
+        (& $bindingOnly -UpdateUsb) | Should -Be 'USBUPDATE'
+    }
+    It 'preserves comment-based help and its angle-bracket path placeholders' {
+        $help = $script:BuilderAst.GetHelpContent()
+        $help.Synopsis | Should -Match 'AutoReset and KillDisk'
+        $help.Parameters['WORKDIR'] | Should -Match '<LocalAppData>\\AutoReset\\Work'
+        $help.Parameters['ISOPATH'] | Should -Match '<OutputRoot>\\AutoReset\.iso'
+        $help.Parameters['STRICTVERIFY'] | Should -Match 'full SHA256 verification'
+        $help.Examples.Count | Should -Be 6
+    }
+    It 'parses the complete file with <Name> and binds update mode without executing the builder' -ForEach @(
+        @{ Name = 'UTF-8 BOM and LF'; Bom = $true; NewLine = "`n" }
+        @{ Name = 'UTF-8 BOM and CRLF'; Bom = $true; NewLine = "`r`n" }
+        @{ Name = 'UTF-8 without BOM and LF'; Bom = $false; NewLine = "`n" }
+        @{ Name = 'UTF-8 without BOM and CRLF'; Bom = $false; NewLine = "`r`n" }
+    ) {
+        $source = [IO.File]::ReadAllText($script:BuilderPath)
+        $source = ($source -replace '\r?\n', $NewLine)
+        $path = Join-Path $TestDrive 'builder-parse-only.ps1'
+        [IO.File]::WriteAllText($path, $source, (New-Object Text.UTF8Encoding($Bom)))
+        $errors = $null
+        $tokens = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+        $errors.Count | Should -Be 0
+        $ast.ParamBlock | Should -Not -BeNullOrEmpty
+        $attributeStart = $ast.ParamBlock.Attributes[0].Extent.StartOffset
+        $headerTokens = @($tokens | Where-Object { $_.Extent.StartOffset -lt $attributeStart })
+        @($headerTokens | Where-Object { $_.Kind -notin @('Comment', 'NewLine') }).Count | Should -Be 0
+        $ast.GetHelpContent().Synopsis | Should -Match 'AutoReset and KillDisk'
+        # Retain the actual header and attributes, replacing all executable build code.
+        $bindingOnly = [scriptblock]::Create(
+            $ast.Extent.Text.Substring(0, $ast.ParamBlock.Extent.EndOffset) +
+            "`n`$PSCmdlet.ParameterSetName")
+        (& $bindingOnly -UpdateUsb) | Should -Be 'USBUPDATE'
+    }
+}
+
 Describe 'Public build parameter binding without entrypoint execution' {
     It 'preserves the complete supported parameter surface and BootOnly alias' {
         $names = @($script:BuilderAst.ParamBlock.Parameters.Name.VariablePath.UserPath | Sort-Object)

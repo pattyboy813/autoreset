@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Builds a stripped-down, auto-running AutoReset and KillDisk WinPE USB or ISO.
 
