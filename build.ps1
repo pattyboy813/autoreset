@@ -611,9 +611,9 @@ function Get-ValidatedUsbVolumes {
     if ($bootPart.Count -ne 1 -or $payloadPart.Count -ne 1 -or
         $bootPart[0].DiskNumber -ne $payloadPart[0].DiskNumber -or
         $bootPart[0].PartitionNumber -eq $payloadPart[0].PartitionNumber -or
-        $bootPart[0].IsReadOnly -ne $false -or $payloadPart[0].IsReadOnly -ne $false -or
-        $bootPart[0].IsBoot -ne $false -or $payloadPart[0].IsBoot -ne $false -or
-        $bootPart[0].IsSystem -ne $false -or $payloadPart[0].IsSystem -ne $false) {
+        $bootPart[0].IsReadOnly -eq $true -or $payloadPart[0].IsReadOnly -eq $true -or
+        $bootPart[0].IsBoot -eq $true -or $payloadPart[0].IsBoot -eq $true -or
+        $bootPart[0].IsSystem -eq $true -or $payloadPart[0].IsSystem -eq $true) {
         throw 'PE and PAYLOAD must be writable, distinct partitions on the same physical USB disk.'
     }
     $disk = Assert-BuildDiskSafe -DiskNumber $bootPart[0].DiskNumber `

@@ -69,6 +69,15 @@ Describe 'Builder disk and volume safeguards' {
         } -ParameterFilter { $DriveLetter -eq 'Q' }
         { Get-ValidatedUsbVolumes } | Should -Throw '*writable*'
     }
+    It 'accepts partitions when boot/system flags are unavailable but not true' {
+        Mock Get-Partition {
+            [pscustomobject]@{ DiskNumber = [uint32]7; PartitionNumber = [uint32]1; IsReadOnly = $false; IsBoot = $null; IsSystem = $null }
+        } -ParameterFilter { $DriveLetter -eq 'P' }
+        Mock Get-Partition {
+            [pscustomobject]@{ DiskNumber = [uint32]7; PartitionNumber = [uint32]2; IsReadOnly = $false; IsBoot = $null; IsSystem = $null }
+        } -ParameterFilter { $DriveLetter -eq 'Q' }
+        (Get-ValidatedUsbVolumes).Disk.Number | Should -Be 7
+    }
     It 'rejects a <Property> disk' -TestCases @(
         @{ Property = 'IsBoot' }, @{ Property = 'IsSystem' }, @{ Property = 'IsReadOnly' }, @{ Property = 'IsOffline' }) {
         param($Property)
