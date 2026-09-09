@@ -36,7 +36,8 @@
     Cold builds commit and remount the base once, so may take longer than before.
     USB payload images and driver archives copy directly from their original
     locations, not through the workspace. ISO builds still materialize these files.
-    Unchanged USB files are SHA256-checked and skipped, not blindly rewritten.
+    Repeated builds trust unchanged size+timestamp metadata by default so large
+    WIMs are not reread. Use -FastRefresh:$false for full SHA256 verification.
     WorkDir is a parent for a unique, builder-owned workspace; existing folders
     and unrelated DISM mounts are never cleaned up. Failed workspaces are retained.
     USB updates require exactly one PE (FAT32) and PAYLOAD (NTFS) volume on the
@@ -81,9 +82,9 @@
     Bypass both serviced-base and customized-final WIM caches (reads and writes).
 
 .PARAMETER FastRefresh
-    Faster USB/ISO file sync: if size and timestamp already match, skip SHA256
-    compare and trust metadata. This is quicker but less strict than full hash
-    verification.
+    Enabled by default. Unchanged size+timestamp files skip repeated SHA256 work
+    during cache planning and USB/ISO sync. Use -FastRefresh:$false when a full
+    byte-level verification of every unchanged file is required.
 
 .PARAMETER DriverCompression
     Fast (default) favors build time: LZMA2 level 1 or ZIP Fastest.
@@ -137,7 +138,7 @@ param(
 
     [switch]$NoCache,
 
-    [switch]$FastRefresh,
+    [switch]$FastRefresh = $true,
 
     [ValidateSet('Fast', 'Balanced', 'Maximum')]
     [string]$DriverCompression = 'Fast',
@@ -526,11 +527,17 @@ function Assert-NoReparsePath {
         $current = $parent
     }
     if ($Recurse -and (Test-Path -LiteralPath $Path -PathType Container)) {
-        foreach ($child in Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop) {
-            if (Test-UnsupportedReparsePoint -Item $child) {
-                throw "Reparse points are not supported in build paths: $($child.FullName)"
+        # Walk each directory once. Calling this function recursively repeated
+        # the same ancestor checks thousands of times in large driver trees.
+        $pending = New-Object 'System.Collections.Generic.Stack[string]'
+        $pending.Push([IO.Path]::GetFullPath($Path))
+        while ($pending.Count -gt 0) {
+            foreach ($child in Get-ChildItem -LiteralPath $pending.Pop() -Force -ErrorAction Stop) {
+                if (Test-UnsupportedReparsePoint -Item $child) {
+                    throw "Reparse points are not supported in build paths: $($child.FullName)"
+                }
+                if ($child.PSIsContainer) { $pending.Push($child.FullName) }
             }
-            if ($child.PSIsContainer) { Assert-NoReparsePath -Path $child.FullName -Recurse }
         }
     }
 }
@@ -628,15 +635,71 @@ function Get-ValidatedUsbVolumes {
     return [pscustomobject]@{ Boot = $boot[0]; Payload = $payload[0]; Disk = $disk }
 }
 
+function Get-CachedFileHash {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ReceiptDirectory,
+        [switch]$TrustMetadata
+    )
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($ReceiptDirectory)) {
+        return (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+    }
+
+    $pathBytes = [Text.Encoding]::UTF8.GetBytes($item.FullName.ToUpperInvariant())
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $receiptName = [BitConverter]::ToString($sha.ComputeHash($pathBytes)).Replace('-', '') + '.json' }
+    finally { $sha.Dispose() }
+    $receiptPath = Join-Path $ReceiptDirectory $receiptName
+
+    if ($TrustMetadata -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+        try {
+            $receipt = Get-Content -LiteralPath $receiptPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($receipt.Version -eq 1 -and [string]$receipt.Path -ceq $item.FullName -and
+                [long]$receipt.Length -eq $item.Length -and
+                [long]$receipt.LastWriteUtcTicks -eq $item.LastWriteTimeUtc.Ticks -and
+                [string]$receipt.Hash -match '^[0-9A-Fa-f]{64}$') {
+                return ([string]$receipt.Hash).ToUpperInvariant()
+            }
+        }
+        catch { Write-BuildLog "Hash receipt unreadable; recalculating: $receiptPath" }
+    }
+
+    $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+    if (-not (Test-Path -LiteralPath $ReceiptDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $ReceiptDirectory -Force | Out-Null
+    }
+    $stage = "$receiptPath.$PID.tmp"
+    try {
+        [pscustomobject]@{
+            Version = 1
+            Path = $item.FullName
+            Length = [long]$item.Length
+            LastWriteUtcTicks = [long]$item.LastWriteTimeUtc.Ticks
+            Hash = $hash
+        } | ConvertTo-Json | Set-Content -LiteralPath $stage -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $stage -Destination $receiptPath -Force -ErrorAction Stop
+    }
+    finally {
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue }
+    }
+    return $hash
+}
+
 function Get-ContentTreeHash {
-    param([Parameter(Mandatory)][string]$Path, [string[]]$Exclude = @())
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$Exclude = @(),
+        [string]$ReceiptDirectory,
+        [switch]$TrustMetadata
+    )
     if (-not (Test-Path -LiteralPath $Path)) { return 'absent' }
     Assert-NoReparsePath -Path $Path -Recurse
     $root = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
     $parts = foreach ($file in @(Get-ChildItem -LiteralPath $Path -Recurse -File -Force |
             Where-Object Name -NotIn $Exclude | Sort-Object FullName)) {
         $relative = $file.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
-        "$relative|$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
+        "$relative|$(Get-CachedFileHash -Path $file.FullName -ReceiptDirectory $ReceiptDirectory -TrustMetadata:$TrustMetadata)"
     }
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($parts -join "`n"))).Replace('-', '') }
@@ -1838,7 +1901,10 @@ if ($ScriptRoot -like '*OneDrive*') {
     Write-Aside 'Consider moving the whole kit to a plain local folder like C:\AutoReset.'
 }
 if ($FastRefresh) {
-    Write-Aside 'FastRefresh enabled: unchanged size+timestamp files skip SHA256 verification for quicker sync.'
+    Write-Aside 'Fast refresh is on: unchanged size+timestamp files reuse cached hashes and skip USB comparison reads.'
+}
+else {
+    Write-Aside 'Strict refresh is on: every unchanged file will be content-verified. This can take much longer.'
 }
 
 # ── Step 2: Prepare work folder ─────────────────────────────────────
@@ -1883,6 +1949,7 @@ Stop-BuildPhase 'copy base media'
 
 $bootWim = Join-Path $mediaDir 'sources\boot.wim'
 Start-BuildPhase 'hash/cache keys'
+Start-Step 'Checking build cache inputs'
 
 $packages = @(
     'WinPE-WMI',
@@ -1895,6 +1962,7 @@ $packages = @(
 $winpeDrivers       = Join-Path $ScriptRoot 'winpe-drivers'
 $srcWinpeWim        = Join-Path $winpeRoot 'en-us\winpe.wim'
 $ocDir = Join-Path $winpeRoot 'WinPE_OCs'
+$hashReceiptDir = Join-Path $cacheDir 'InputHashes'
 $packagePaths = @()
 foreach ($pkg in $packages) {
     $cab = Join-Path $ocDir "$pkg.cab"
@@ -1905,28 +1973,29 @@ foreach ($pkg in $packages) {
 }
 
 $baseParts = @(
-    "src:$((Get-FileHash -LiteralPath $srcWinpeWim -Algorithm SHA256).Hash)",
+    "src:$(Get-CachedFileHash -Path $srcWinpeWim -ReceiptDirectory $hashReceiptDir -TrustMetadata:$FastRefresh)",
     "arch:$script:Arch", "lang:$script:Lang", 'scratch:512',
     "recipe:$((Get-Command Invoke-WinPEBaseServicing).Definition)",
-    "wpd:$(Get-ContentTreeHash -Path $winpeDrivers)"
+    "wpd:$(Get-ContentTreeHash -Path $winpeDrivers -ReceiptDirectory $hashReceiptDir -TrustMetadata:$FastRefresh)"
 )
 foreach ($cab in $packagePaths) {
     $relativeCab = $cab.Substring($ocDir.Length).TrimStart('\', '/').Replace('\', '/')
-    $baseParts += "cab:$relativeCab|$((Get-FileHash -LiteralPath $cab -Algorithm SHA256).Hash)"
+    $baseParts += "cab:$relativeCab|$(Get-CachedFileHash -Path $cab -ReceiptDirectory $hashReceiptDir -TrustMetadata:$FastRefresh)"
 }
 $runtimeParts = @(
-    "config:$((Get-FileHash -LiteralPath (Join-Path $payloadSrc 'reset.json') -Algorithm SHA256).Hash)",
-    "tools:$(Get-ContentTreeHash -Path (Join-Path $payloadSrc 'tools'))",
-    "bootsect:$((Get-FileHash -LiteralPath $bootsect -Algorithm SHA256).Hash)",
+    "config:$(Get-CachedFileHash -Path (Join-Path $payloadSrc 'reset.json') -ReceiptDirectory $hashReceiptDir -TrustMetadata:$FastRefresh)",
+    "tools:$(Get-ContentTreeHash -Path (Join-Path $payloadSrc 'tools') -ReceiptDirectory $hashReceiptDir -TrustMetadata:$FastRefresh)",
+    "bootsect:$(Get-CachedFileHash -Path $bootsect -ReceiptDirectory $hashReceiptDir -TrustMetadata:$FastRefresh)",
     "res:$WinPEResolution"
 )
 foreach ($rf in ($runtimeFiles | Sort-Object FullName)) {
-    $runtimeParts += "$($rf.Name):$((Get-FileHash -LiteralPath $rf.FullName -Algorithm SHA256).Hash)"
+    $runtimeParts += "$($rf.Name):$(Get-CachedFileHash -Path $rf.FullName -ReceiptDirectory $hashReceiptDir -TrustMetadata:$FastRefresh)"
 }
 foreach ($helper in @('Sync-RuntimePayload', 'Copy-RuntimeScript', 'Copy-ChangedFile', 'Set-WinPEStartup', 'Invoke-Robocopy')) {
     $runtimeParts += "helper:${helper}:$((Get-Command $helper).Definition)"
 }
 $cachePlan = Get-WinPECachePlan -CacheDirectory $cacheDir -BaseParts $baseParts -RuntimeParts $runtimeParts
+Write-StepDone 'Checked build cache inputs'
 Stop-BuildPhase 'hash/cache keys'
 Invoke-WinPEImageBuild -CachePlan $cachePlan -SourceWim $srcWinpeWim -BootWim $bootWim -MountPath $mountDir `
     -PackagePaths $packagePaths -DriverPath $winpeDrivers -RuntimeFiles $runtimeFiles -PayloadSource $payloadSrc `

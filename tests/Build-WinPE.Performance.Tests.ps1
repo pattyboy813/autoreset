@@ -28,6 +28,38 @@ Describe 'Independent serviced and customized WinPE caches' {
         $runtime = @('scripts:ui-a', 'config:config-a', 'tools:tools-a', 'display:auto', 'recipe:runtime-v1')
         $cache = Join-Path $TestDrive 'cache'
     }
+
+    Describe 'Cached build input hashing' {
+        BeforeEach {
+            $script:HashSource = Join-Path $TestDrive 'large-input.bin'
+            $script:HashReceipts = Join-Path $TestDrive 'hash-receipts'
+            [IO.File]::WriteAllText($script:HashSource, 'unchanged input')
+        }
+        It 'reuses a trusted hash when file metadata is unchanged' {
+            $first = Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts -TrustMetadata
+            Mock Get-FileHash { throw 'An unchanged input should use its hash receipt.' }
+            $second = Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts -TrustMetadata
+            $second | Should -Be $first
+            Should -Invoke Get-FileHash -Times 0
+        }
+        It 'rehashes a changed input before reusing a build cache' {
+            $null = Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts -TrustMetadata
+            [IO.File]::AppendAllText($script:HashSource, '-changed')
+            Mock Get-FileHash { [pscustomobject]@{ Hash = ('A' * 64 -join '') } }
+            Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts -TrustMetadata |
+                Should -Be ('A' * 64)
+            Should -Invoke Get-FileHash -Times 1
+        }
+        It 'does not trust metadata when strict refresh is requested' {
+            $null = Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts -TrustMetadata
+            Mock Get-FileHash { [pscustomobject]@{ Hash = ('B' * 64 -join '') } }
+            Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts |
+                Should -Be ('B' * 64)
+            Should -Invoke Get-FileHash -Times 1
+            Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts -TrustMetadata |
+                Should -Be ('B' * 64)
+        }
+    }
     It 'reuses both keys for identical inputs' {
         $first = Get-WinPECachePlan -CacheDirectory $cache -BaseParts $base -RuntimeParts $runtime
         $second = Get-WinPECachePlan -CacheDirectory $cache -BaseParts $base -RuntimeParts $runtime

@@ -94,6 +94,9 @@ Describe 'KillDisk child process result' {
 
 Describe 'Deployment structure and shared UI integration' {
     It 'parses without errors' { $script:ParseErrors.Count | Should -Be 0 }
+    It 'does not use an empty script parameter block rejected by WinPE PowerShell' {
+        $script:DeploymentSource | Should -Not -Match '(?m)^param\(\)\s*$'
+    }
     It 'loads shared helpers relative to its deployed script' {
         $script:DeploymentSource | Should -Match "\. \(Join-Path \`$PSScriptRoot 'autoreset.common.ps1'\)"
         $script:DeploymentSource | Should -Match "\. \(Join-Path \`$PSScriptRoot 'autoreset.ui.ps1'\)"
@@ -120,6 +123,15 @@ Describe 'Deployment structure and shared UI integration' {
     }
     It 'logs the deployed script path and SHA256' {
         $script:DeploymentSource | Should -Match 'Running script: \$PSCommandPath \| SHA256'
+    }
+    It 'defines console recovery before startup initialization and hides it only afterwards' {
+        $showConsole = $script:DeploymentSource.IndexOf('function Show-Console')
+        $startup = $script:DeploymentSource.IndexOf("Write-BootstrapLog 'Loading WinForms assemblies.'")
+        $hideConsole = $script:DeploymentSource.IndexOf("`r`nHide-Console`r`n")
+        if ($hideConsole -lt 0) { $hideConsole = $script:DeploymentSource.IndexOf("`nHide-Console`n") }
+        $showConsole | Should -BeLessThan $startup
+        $hideConsole | Should -BeGreaterThan $startup
+        $script:DeploymentSource | Should -Match '(?s)catch \{\s*Write-BootstrapLog "Startup initialization failed:.*?Show-Console'
     }
 }
 

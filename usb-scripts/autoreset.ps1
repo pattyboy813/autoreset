@@ -12,7 +12,6 @@
     Press F8 at any time for a command prompt.
     Press Ctrl+Shift+W on the disk confirmation screen for disk overwrite.
 #>
-param()
 
 $ErrorActionPreference = 'Stop'
 
@@ -34,6 +33,22 @@ function Write-BootstrapLog {
     catch { }
 }
 Write-BootstrapLog "Startup begin: $PSCommandPath"
+
+# The launcher starts PowerShell hidden. Define these helpers before loading any
+# optional UI code so an early failure can reveal the console.
+try {
+    Add-Type -Name ConsoleUtil -Namespace Ar -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")]  public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+'@
+}
+catch { }
+function Show-Console {
+    try { [void][Ar.ConsoleUtil]::ShowWindow([Ar.ConsoleUtil]::GetConsoleWindow(), 5) } catch { }
+}
+function Hide-Console {
+    try { [void][Ar.ConsoleUtil]::ShowWindow([Ar.ConsoleUtil]::GetConsoleWindow(), 0) } catch { }
+}
 
 trap {
     $failure = $_
@@ -58,12 +73,12 @@ try {
     . (Join-Path $PSScriptRoot 'autoreset.ui.ps1')
     Assert-WinPEEnvironment
 
-    [System.Windows.Forms.Application]::EnableVisualStyles()
     Write-BootstrapLog 'Startup initialization complete.'
 }
 catch {
     Write-BootstrapLog "Startup initialization failed: $($_.Exception.Message)"
     Write-BootstrapLog "Line: $($_.InvocationInfo.ScriptLineNumber)"
+    Show-Console
     try {
         [void][System.Windows.Forms.MessageBox]::Show(
             "AutoReset failed before the Preparing screen.`r`n`r`n$($_.Exception.Message)`r`n`r`nBootstrap log: $($script:BootstrapLog)",
@@ -80,18 +95,7 @@ $script:Version = '2.0.0'
 
 # ── Console visibility ──────────────────────────────────────────────
 
-try {
-    Add-Type -Name ConsoleUtil -Namespace Ar -MemberDefinition @'
-[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
-[DllImport("user32.dll")]  public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-'@
-    [void][Ar.ConsoleUtil]::ShowWindow([Ar.ConsoleUtil]::GetConsoleWindow(), 0)
-}
-catch { }
-
-function Show-Console {
-    try { [void][Ar.ConsoleUtil]::ShowWindow([Ar.ConsoleUtil]::GetConsoleWindow(), 5) } catch { }
-}
+Hide-Console
 
 # ── Logging ─────────────────────────────────────────────────────────
 
