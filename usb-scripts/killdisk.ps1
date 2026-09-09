@@ -432,7 +432,7 @@ while (-not $confirmed) {
 
 # ── Wipe progress ───────────────────────────────────────────────────
 
-$dlgProgress = New-WipeForm -Title 'Wiping Disk(s)' -Width 500
+$dlgProgress = New-WipeForm -Title 'Wiping Disk(s)' -Width 500 -MinimumHeight 170
 
 $lblCurrent             = New-Object System.Windows.Forms.Label
 $lblCurrent.Text        = 'Preparing...'

@@ -16,6 +16,25 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+$bootstrapRoot = 'X:\Windows\Temp'
+if (-not (Test-Path -LiteralPath $bootstrapRoot)) {
+    $bootstrapRoot = $env:TEMP
+    if ([string]::IsNullOrWhiteSpace($bootstrapRoot)) {
+        $bootstrapRoot = [System.IO.Path]::GetTempPath().TrimEnd('\', '/')
+    }
+}
+$script:BootstrapLog = Join-Path $bootstrapRoot 'AutoReset-Bootstrap.log'
+function Write-BootstrapLog {
+    param([Parameter(Mandatory)][string]$Message)
+    try {
+        Add-Content -LiteralPath $script:BootstrapLog -Value (
+            '{0}  {1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $Message
+        ) -ErrorAction SilentlyContinue
+    }
+    catch { }
+}
+Write-BootstrapLog "Startup begin: $PSCommandPath"
+
 trap {
     $failure = $_
     try { Show-Console } catch { }
@@ -29,14 +48,33 @@ trap {
     exit 1
 }
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+try {
+    Write-BootstrapLog 'Loading WinForms assemblies.'
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
 
-. (Join-Path $PSScriptRoot 'autoreset.common.ps1')
-. (Join-Path $PSScriptRoot 'autoreset.ui.ps1')
-Assert-WinPEEnvironment
+    Write-BootstrapLog 'Loading shared AutoReset scripts.'
+    . (Join-Path $PSScriptRoot 'autoreset.common.ps1')
+    . (Join-Path $PSScriptRoot 'autoreset.ui.ps1')
+    Assert-WinPEEnvironment
 
-[System.Windows.Forms.Application]::EnableVisualStyles()
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+    Write-BootstrapLog 'Startup initialization complete.'
+}
+catch {
+    Write-BootstrapLog "Startup initialization failed: $($_.Exception.Message)"
+    Write-BootstrapLog "Line: $($_.InvocationInfo.ScriptLineNumber)"
+    try {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "AutoReset failed before the Preparing screen.`r`n`r`n$($_.Exception.Message)`r`n`r`nBootstrap log: $($script:BootstrapLog)",
+            'AutoReset startup error', 'OK', 'Error')
+    }
+    catch {
+        Write-Host "AutoReset startup failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Bootstrap log: $($script:BootstrapLog)" -ForegroundColor Yellow
+    }
+    exit 1
+}
 
 $script:Version = '2.0.0'
 
