@@ -80,6 +80,11 @@
 .PARAMETER NoCache
     Bypass both serviced-base and customized-final WIM caches (reads and writes).
 
+.PARAMETER FastRefresh
+    Faster USB/ISO file sync: if size and timestamp already match, skip SHA256
+    compare and trust metadata. This is quicker but less strict than full hash
+    verification.
+
 .PARAMETER DriverCompression
     Fast (default) favors build time: LZMA2 level 1 or ZIP Fastest.
     Balanced uses LZMA2 level 5; Maximum uses level 9 with a larger dictionary.
@@ -131,6 +136,8 @@ param(
     [switch]$UpdateUsb,
 
     [switch]$NoCache,
+
+    [switch]$FastRefresh,
 
     [ValidateSet('Fast', 'Balanced', 'Maximum')]
     [string]$DriverCompression = 'Fast',
@@ -506,33 +513,26 @@ function Test-UnsupportedReparsePoint {
 
 function Assert-NoReparsePath {
     param([Parameter(Mandatory)][string]$Path, [switch]$Recurse)
-    if (-not $script:ReparsePathCache) { $script:ReparsePathCache = @{} }
-    $fullPath = [IO.Path]::GetFullPath($Path)
-    $cacheKey = '{0}|{1}' -f $fullPath, [bool]$Recurse
-    if ($script:ReparsePathCache.ContainsKey($cacheKey)) { return }
-    $current = $fullPath
+    $current = [IO.Path]::GetFullPath($Path)
     while ($current) {
-        $ancestorKey = '{0}|False' -f $current
-        if ($script:ReparsePathCache.ContainsKey($ancestorKey)) { break }
         if (Test-Path -LiteralPath $current) {
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
             if (Test-UnsupportedReparsePoint -Item $item) {
                 throw "Reparse points are not supported in build paths: $current"
             }
         }
-        $script:ReparsePathCache[$ancestorKey] = $true
         $parent = Split-Path -Parent $current
         if ($parent -eq $current) { break }
         $current = $parent
     }
-    if ($Recurse -and (Test-Path -LiteralPath $fullPath -PathType Container)) {
-        foreach ($child in Get-ChildItem -LiteralPath $fullPath -Force -Recurse -ErrorAction Stop) {
+    if ($Recurse -and (Test-Path -LiteralPath $Path -PathType Container)) {
+        foreach ($child in Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop) {
             if (Test-UnsupportedReparsePoint -Item $child) {
                 throw "Reparse points are not supported in build paths: $($child.FullName)"
             }
+            if ($child.PSIsContainer) { Assert-NoReparsePath -Path $child.FullName -Recurse }
         }
     }
-    $script:ReparsePathCache[$cacheKey] = $true
 }
 
 function Assert-SafeMirror {
@@ -575,7 +575,6 @@ function Assert-BuildDiskSafe {
 
 function Get-BuildProtectedDiskNumbers {
     param([Parameter(Mandatory)][string[]]$Paths)
-    if (-not $script:ProtectedDiskPathCache) { $script:ProtectedDiskPathCache = @{} }
     $supportsFilePath = (Get-Command -Name Get-Partition -ErrorAction Stop).Parameters.ContainsKey('FilePath')
     $numbers = foreach ($path in $Paths) {
         if (-not $path) { continue }
@@ -585,11 +584,6 @@ function Get-BuildProtectedDiskNumbers {
             $parent = Split-Path -Parent $existing
             if (-not $parent -or $parent -eq $existing) { throw "Cannot identify source/output disk: $path" }
             $existing = $parent
-        }
-        $cacheKey = $existing.ToUpperInvariant()
-        if ($script:ProtectedDiskPathCache.ContainsKey($cacheKey)) {
-            [int]$script:ProtectedDiskPathCache[$cacheKey]
-            continue
         }
         if ($supportsFilePath) {
             $partitions = @(Get-Partition -FilePath $existing -ErrorAction Stop)
@@ -601,7 +595,6 @@ function Get-BuildProtectedDiskNumbers {
         }
         $diskNumbers = @($partitions.DiskNumber | Sort-Object -Unique)
         if ($diskNumbers.Count -ne 1) { throw "Cannot unambiguously identify source/output disk: $path" }
-        $script:ProtectedDiskPathCache[$cacheKey] = [int]$diskNumbers[0]
         [int]$diskNumbers[0]
     }
     return @($numbers | Sort-Object -Unique)
@@ -993,6 +986,7 @@ function Sync-BuildFiles {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Files,
         [Parameter(Mandatory)][string]$Destination,
+        [switch]$FastRefresh,
         [switch]$Mirror,
         [string[]]$PreserveDirectories = @('Logs')
     )
@@ -1062,17 +1056,14 @@ function Sync-BuildFiles {
     $copied = 0L; $skipped = 0L; $copiedBytes = 0L; $skippedBytes = 0L
     foreach ($entry in $plan) {
         $same = $false
-        $sourceItem = Get-Item -LiteralPath $entry.SourcePath -Force -ErrorAction Stop
         if (Test-Path -LiteralPath $entry.TargetPath -PathType Leaf) {
-            $targetItem = Get-Item -LiteralPath $entry.TargetPath -Force -ErrorAction Stop
-            $same = $targetItem.Length -eq $entry.Length
-            if ($same) {
-                # Fast path: unchanged size + timestamp means no expensive hash pass.
-                $timeDelta = [math]::Abs(($sourceItem.LastWriteTimeUtc - $targetItem.LastWriteTimeUtc).TotalSeconds)
-                if ($timeDelta -le 2) {
-                    $same = $true
+            $target = Get-Item -LiteralPath $entry.TargetPath -Force -ErrorAction Stop
+            if ($target.Length -eq $entry.Length) {
+                if ($FastRefresh) {
+                    $source = Get-Item -LiteralPath $entry.SourcePath -Force -ErrorAction Stop
+                    $same = [math]::Abs(($source.LastWriteTimeUtc - $target.LastWriteTimeUtc).TotalSeconds) -le 2
                 }
-                else {
+                if (-not $same) {
                     $same = (Get-FileHash -LiteralPath $entry.SourcePath -Algorithm SHA256 -ErrorAction Stop).Hash -eq
                         (Get-FileHash -LiteralPath $entry.TargetPath -Algorithm SHA256 -ErrorAction Stop).Hash
                 }
@@ -1081,7 +1072,6 @@ function Sync-BuildFiles {
         if ($same) { $skipped++; $skippedBytes += $entry.Length; continue }
         New-Item -ItemType Directory -Path (Split-Path -Parent $entry.TargetPath) -Force | Out-Null
         Copy-Item -LiteralPath $entry.SourcePath -Destination $entry.TargetPath -Force -ErrorAction Stop
-        try { (Get-Item -LiteralPath $entry.TargetPath -Force -ErrorAction Stop).LastWriteTimeUtc = $sourceItem.LastWriteTimeUtc } catch { }
         $copied++; $copiedBytes += $entry.Length
     }
     foreach ($item in ($existing | Sort-Object { $_.FullName.Length } -Descending)) {
@@ -1787,6 +1777,9 @@ if ($ScriptRoot -like '*OneDrive*') {
     Write-Aside "This folder is inside OneDrive. Work folder moved to $WorkDir to avoid sync issues."
     Write-Aside 'Consider moving the whole kit to a plain local folder like C:\AutoReset.'
 }
+if ($FastRefresh) {
+    Write-Aside 'FastRefresh enabled: unchanged size+timestamp files skip SHA256 verification for quicker sync.'
+}
 
 # ── Step 2: Prepare work folder ─────────────────────────────────────
 
@@ -1953,7 +1946,7 @@ Start-BuildPhase 'output'
 
 if ($PSCmdlet.ParameterSetName -eq 'ISO') {
     Start-BuildPhase 'copy ISO payload'
-    Sync-BuildFiles -Files $externalPayloadFiles -Destination $mediaPayload
+    Sync-BuildFiles -Files $externalPayloadFiles -Destination $mediaPayload -FastRefresh:$FastRefresh
     Stop-BuildPhase 'copy ISO payload'
     if (-not (Test-Path -LiteralPath $oscdimg)) {
         throw "oscdimg.exe not found at $oscdimg. Install the ADK Deployment Tools and retry."
@@ -2013,7 +2006,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'USBUPDATE') {
     }
 
     Start-BuildPhase 'copy USB refresh'
-    Sync-BuildFiles -Files $bootFiles -Destination $bootDrive
+    Sync-BuildFiles -Files $bootFiles -Destination $bootDrive -FastRefresh:$FastRefresh
     $currentVolumes = Get-ValidatedUsbVolumes -ProtectedDiskNumbers $protectedDisks -ExpectedIdentity $targetIdentity
     Assert-UsbPayloadOwnership -Volume $currentVolumes.Payload
     if ($currentVolumes.Boot.DriveLetter -ne $bootVol.DriveLetter -or
@@ -2021,7 +2014,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'USBUPDATE') {
         $currentVolumes.Disk.Number -ne $targetNumber) {
         throw 'USB partition mapping changed during the refresh.'
     }
-    Sync-BuildFiles -Files $payloadFiles -Destination (Join-Path $payloadDrive 'Payload') -Mirror -PreserveDirectories @('Logs')
+    Sync-BuildFiles -Files $payloadFiles -Destination (Join-Path $payloadDrive 'Payload') -FastRefresh:$FastRefresh -Mirror -PreserveDirectories @('Logs')
     Stop-BuildPhase 'copy USB refresh'
     Write-StepDone 'Refreshed existing deployment stick'
     Write-Host ''
@@ -2075,7 +2068,7 @@ else {
         -ProtectedDiskNumbers $protectedDisks -AllowNonUsb:$AllowNonUsbDisk
     Assert-BuildPartitionMapping -DiskNumber $UsbDiskNumber -PartitionNumber $bootPart.PartitionNumber -DriveLetter $bootLetter
     Start-BuildPhase 'copy USB boot'
-    Sync-BuildFiles -Files $bootFiles -Destination $bootDrive
+    Sync-BuildFiles -Files $bootFiles -Destination $bootDrive -FastRefresh:$FastRefresh
     Stop-BuildPhase 'copy USB boot'
     Write-StepDone "Copied boot files to $bootLetter`:"
 
@@ -2084,7 +2077,7 @@ else {
         -ProtectedDiskNumbers $protectedDisks -AllowNonUsb:$AllowNonUsbDisk
     Assert-BuildPartitionMapping -DiskNumber $UsbDiskNumber -PartitionNumber $payloadPart.PartitionNumber -DriveLetter $payloadLetter
     Start-BuildPhase 'copy USB payload'
-    Sync-BuildFiles -Files $payloadFiles -Destination (Join-Path $payloadDrive 'Payload') -Mirror -PreserveDirectories @('Logs')
+    Sync-BuildFiles -Files $payloadFiles -Destination (Join-Path $payloadDrive 'Payload') -FastRefresh:$FastRefresh -Mirror -PreserveDirectories @('Logs')
     Stop-BuildPhase 'copy USB payload'
     Write-StepDone "Copied payload to $payloadLetter`:"
 
