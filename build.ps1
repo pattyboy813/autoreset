@@ -506,26 +506,33 @@ function Test-UnsupportedReparsePoint {
 
 function Assert-NoReparsePath {
     param([Parameter(Mandatory)][string]$Path, [switch]$Recurse)
-    $current = [IO.Path]::GetFullPath($Path)
+    if (-not $script:ReparsePathCache) { $script:ReparsePathCache = @{} }
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $cacheKey = '{0}|{1}' -f $fullPath, [bool]$Recurse
+    if ($script:ReparsePathCache.ContainsKey($cacheKey)) { return }
+    $current = $fullPath
     while ($current) {
+        $ancestorKey = '{0}|False' -f $current
+        if ($script:ReparsePathCache.ContainsKey($ancestorKey)) { break }
         if (Test-Path -LiteralPath $current) {
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
             if (Test-UnsupportedReparsePoint -Item $item) {
                 throw "Reparse points are not supported in build paths: $current"
             }
         }
+        $script:ReparsePathCache[$ancestorKey] = $true
         $parent = Split-Path -Parent $current
         if ($parent -eq $current) { break }
         $current = $parent
     }
-    if ($Recurse -and (Test-Path -LiteralPath $Path -PathType Container)) {
-        foreach ($child in Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop) {
+    if ($Recurse -and (Test-Path -LiteralPath $fullPath -PathType Container)) {
+        foreach ($child in Get-ChildItem -LiteralPath $fullPath -Force -Recurse -ErrorAction Stop) {
             if (Test-UnsupportedReparsePoint -Item $child) {
                 throw "Reparse points are not supported in build paths: $($child.FullName)"
             }
-            if ($child.PSIsContainer) { Assert-NoReparsePath -Path $child.FullName -Recurse }
         }
     }
+    $script:ReparsePathCache[$cacheKey] = $true
 }
 
 function Assert-SafeMirror {
@@ -568,6 +575,7 @@ function Assert-BuildDiskSafe {
 
 function Get-BuildProtectedDiskNumbers {
     param([Parameter(Mandatory)][string[]]$Paths)
+    if (-not $script:ProtectedDiskPathCache) { $script:ProtectedDiskPathCache = @{} }
     $supportsFilePath = (Get-Command -Name Get-Partition -ErrorAction Stop).Parameters.ContainsKey('FilePath')
     $numbers = foreach ($path in $Paths) {
         if (-not $path) { continue }
@@ -577,6 +585,11 @@ function Get-BuildProtectedDiskNumbers {
             $parent = Split-Path -Parent $existing
             if (-not $parent -or $parent -eq $existing) { throw "Cannot identify source/output disk: $path" }
             $existing = $parent
+        }
+        $cacheKey = $existing.ToUpperInvariant()
+        if ($script:ProtectedDiskPathCache.ContainsKey($cacheKey)) {
+            [int]$script:ProtectedDiskPathCache[$cacheKey]
+            continue
         }
         if ($supportsFilePath) {
             $partitions = @(Get-Partition -FilePath $existing -ErrorAction Stop)
@@ -588,6 +601,7 @@ function Get-BuildProtectedDiskNumbers {
         }
         $diskNumbers = @($partitions.DiskNumber | Sort-Object -Unique)
         if ($diskNumbers.Count -ne 1) { throw "Cannot unambiguously identify source/output disk: $path" }
+        $script:ProtectedDiskPathCache[$cacheKey] = [int]$diskNumbers[0]
         [int]$diskNumbers[0]
     }
     return @($numbers | Sort-Object -Unique)
