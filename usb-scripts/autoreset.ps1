@@ -12,7 +12,6 @@
     Press F8 at any time for a command prompt.
     Press Ctrl+Shift+W on the disk confirmation screen for disk overwrite.
 #>
-param()
 
 $ErrorActionPreference = 'Stop'
 

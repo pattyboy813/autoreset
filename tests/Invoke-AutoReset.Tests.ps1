@@ -94,6 +94,9 @@ Describe 'KillDisk child process result' {
 
 Describe 'Deployment structure and shared UI integration' {
     It 'parses without errors' { $script:ParseErrors.Count | Should -Be 0 }
+    It 'does not use an empty script parameter block rejected by WinPE PowerShell' {
+        $script:DeploymentSource | Should -Not -Match '(?m)^param\(\)\s*$'
+    }
     It 'loads shared helpers relative to its deployed script' {
         $script:DeploymentSource | Should -Match "\. \(Join-Path \`$PSScriptRoot 'autoreset.common.ps1'\)"
         $script:DeploymentSource | Should -Match "\. \(Join-Path \`$PSScriptRoot 'autoreset.ui.ps1'\)"
