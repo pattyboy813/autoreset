@@ -11,7 +11,7 @@
         'Get-DeploymentImage', 'Assert-ArchiveEntryPath', 'Assert-DriverArchiveUnchanged', 'Expand-ValidatedDriverArchive',
         'Get-PreparedDrivers', 'Invoke-DeploymentPreflight', 'Invoke-CheckedTool',
         'Assert-TargetBootConfiguration', 'Install-RecoveryFirstBootHook', 'Copy-LogsToTarget',
-        'Invoke-KillDiskProcess', 'Select-DeploymentMediaRoot', 'Find-MediaRoot',
+        'Invoke-KillDiskProcess', 'Stage-KillDiskRuntime', 'Select-DeploymentMediaRoot', 'Find-MediaRoot',
         'Get-DeploymentSourceIdentity', 'Assert-DeploymentSourceUnchanged', 'Title'
     )
     foreach ($definition in $script:DeploymentAst.FindAll({
@@ -43,6 +43,38 @@ Describe 'KillDisk child process result' {
     BeforeEach {
         Mock Write-Log { }
         Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+    }
+
+    Describe 'KillDisk local staging' {
+        It 'copies required KillDisk scripts to local runtime storage' {
+            $mediaRoot = Join-Path $TestDrive 'media\Payload'
+            $scripts = Join-Path $mediaRoot 'Scripts'
+            New-Item -ItemType Directory -Path $scripts -Force | Out-Null
+            foreach ($name in @('killdisk.ps1', 'autoreset.common.ps1', 'autoreset.ui.ps1')) {
+                Set-Content -LiteralPath (Join-Path $scripts $name) -Value "# $name" -Encoding UTF8
+            }
+            $tempBefore = $env:TEMP
+            try {
+                $env:TEMP = $TestDrive
+                $staged = Stage-KillDiskRuntime -SourceRoots @($mediaRoot)
+                $stageRoot = Split-Path -Parent $staged
+                $staged | Should -Be (Join-Path $stageRoot 'killdisk.ps1')
+                foreach ($name in @('killdisk.ps1', 'autoreset.common.ps1', 'autoreset.ui.ps1')) {
+                    Test-Path -LiteralPath (Join-Path $stageRoot $name) | Should -BeTrue
+                }
+            }
+            finally {
+                $env:TEMP = $tempBefore
+            }
+        }
+
+        It 'fails if any required KillDisk runtime script is missing' {
+            $mediaRoot = Join-Path $TestDrive 'media\Payload'
+            $scripts = Join-Path $mediaRoot 'Scripts'
+            New-Item -ItemType Directory -Path $scripts -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $scripts 'killdisk.ps1') -Value '# killdisk' -Encoding UTF8
+            { Stage-KillDiskRuntime -SourceRoots @($mediaRoot) } | Should -Throw '*autoreset.common.ps1*'
+        }
     }
     It 'waits for and verifies the child result' {
         { Invoke-KillDiskProcess -ScriptPath 'killdisk.ps1' -Serial 'TEST' } | Should -Not -Throw

@@ -506,6 +506,41 @@ function Invoke-KillDiskProcess {
     }
 }
 
+function Stage-KillDiskRuntime {
+    param([Parameter(Mandatory)][string[]]$SourceRoots)
+    $required = @(
+        'Scripts\killdisk.ps1',
+        'Scripts\autoreset.common.ps1',
+        'Scripts\autoreset.ui.ps1'
+    )
+    $resolved = @{}
+    foreach ($relative in $required) {
+        foreach ($root in $SourceRoots) {
+            if (-not $root) { continue }
+            $candidate = Join-Path $root $relative
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $resolved[$relative] = $candidate
+                break
+            }
+        }
+        if (-not $resolved.ContainsKey($relative)) {
+            throw "$relative was not found on the deployment media."
+        }
+    }
+
+    $stageRoot = 'X:\Windows\Temp\AutoReset-KillDisk'
+    if (-not (Test-Path -LiteralPath 'X:\Windows\Temp')) {
+        $stageRoot = Join-Path $env:TEMP 'AutoReset-KillDisk'
+    }
+    New-Item -ItemType Directory -Path $stageRoot -Force -ErrorAction Stop | Out-Null
+
+    foreach ($relative in $required) {
+        $destination = Join-Path $stageRoot ([System.IO.Path]::GetFileName($relative))
+        Copy-Item -LiteralPath $resolved[$relative] -Destination $destination -Force -ErrorAction Stop
+    }
+    return (Join-Path $stageRoot 'killdisk.ps1')
+}
+
 function Get-InitialTargetDisk {
     param([object[]]$Disks, [int[]]$ProtectedDiskNumbers, $ConfiguredNumber)
     $eligible = @($Disks | Where-Object {
@@ -1268,31 +1303,13 @@ if (Get-Config 'ConfirmBeforeWipe' $true) {
         if ($confirmResult -eq [System.Windows.Forms.DialogResult]::Abort) {
             try {
                 Write-Log 'User triggered KillDisk launch (Ctrl+Shift+W).'
-
-                $wipeScript = $null
-                foreach ($root in @($script:MediaRoot, $script:ImagePayloadRoot)) {
-                    if (-not $root) { continue }
-                    $candidate = Join-Path $root 'Scripts\killdisk.ps1'
-                    Write-Log "Checking for wipe script: $candidate"
-                    if (Test-Path $candidate) { $wipeScript = $candidate; break }
-                }
-
                 Write-Log "MediaRoot: $($script:MediaRoot)"
                 Write-Log "ImagePayloadRoot: $($script:ImagePayloadRoot)"
-                Write-Log "Resolved wipe script: $wipeScript"
-
-                if ($wipeScript) {
-                    Invoke-KillDiskProcess -ScriptPath $wipeScript -Serial $script:Serial
-                    exit 0
-                }
-                else {
-                    Write-Log 'killdisk.ps1 not found on media.' 'ERROR'
-                    [void][System.Windows.Forms.MessageBox]::Show(
-                        'killdisk.ps1 was not found on the deployment media.',
-                        (Title 'Error'),
-                        [System.Windows.Forms.MessageBoxButtons]::OK,
-                        [System.Windows.Forms.MessageBoxIcon]::Error)
-                }
+                $stagedWipeScript = Stage-KillDiskRuntime -SourceRoots @($script:MediaRoot, $script:ImagePayloadRoot)
+                Write-Log "Staged wipe script: $stagedWipeScript"
+                Write-Log 'KillDisk scripts are now running from local WinPE storage; deployment media can be removed.'
+                Invoke-KillDiskProcess -ScriptPath $stagedWipeScript -Serial $script:Serial
+                exit 0
             }
             catch {
                 Write-Log "KillDisk launch FAILED: $($_.Exception.Message)" 'ERROR'
