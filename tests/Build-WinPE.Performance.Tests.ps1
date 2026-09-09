@@ -45,14 +45,14 @@ Describe 'Independent serviced and customized WinPE caches' {
         It 'rehashes a changed input before reusing a build cache' {
             $null = Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts -TrustMetadata
             [IO.File]::AppendAllText($script:HashSource, '-changed')
-            Mock Get-FileHash { 'A' * 64 }
+            Mock Get-FileHash { [pscustomobject]@{ Hash = ('A' * 64 -join '') } }
             Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts -TrustMetadata |
                 Should -Be ('A' * 64)
             Should -Invoke Get-FileHash -Times 1
         }
         It 'does not trust metadata when strict refresh is requested' {
             $null = Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts -TrustMetadata
-            Mock Get-FileHash { 'B' * 64 }
+            Mock Get-FileHash { [pscustomobject]@{ Hash = ('B' * 64 -join '') } }
             Get-CachedFileHash -Path $script:HashSource -ReceiptDirectory $script:HashReceipts |
                 Should -Be ('B' * 64)
             Should -Invoke Get-FileHash -Times 1
