@@ -1048,16 +1048,26 @@ function Sync-BuildFiles {
     $copied = 0L; $skipped = 0L; $copiedBytes = 0L; $skippedBytes = 0L
     foreach ($entry in $plan) {
         $same = $false
+        $sourceItem = Get-Item -LiteralPath $entry.SourcePath -Force -ErrorAction Stop
         if (Test-Path -LiteralPath $entry.TargetPath -PathType Leaf) {
-            $same = (Get-Item -LiteralPath $entry.TargetPath -Force -ErrorAction Stop).Length -eq $entry.Length
+            $targetItem = Get-Item -LiteralPath $entry.TargetPath -Force -ErrorAction Stop
+            $same = $targetItem.Length -eq $entry.Length
             if ($same) {
-                $same = (Get-FileHash -LiteralPath $entry.SourcePath -Algorithm SHA256 -ErrorAction Stop).Hash -eq
-                    (Get-FileHash -LiteralPath $entry.TargetPath -Algorithm SHA256 -ErrorAction Stop).Hash
+                # Fast path: unchanged size + timestamp means no expensive hash pass.
+                $timeDelta = [math]::Abs(($sourceItem.LastWriteTimeUtc - $targetItem.LastWriteTimeUtc).TotalSeconds)
+                if ($timeDelta -le 2) {
+                    $same = $true
+                }
+                else {
+                    $same = (Get-FileHash -LiteralPath $entry.SourcePath -Algorithm SHA256 -ErrorAction Stop).Hash -eq
+                        (Get-FileHash -LiteralPath $entry.TargetPath -Algorithm SHA256 -ErrorAction Stop).Hash
+                }
             }
         }
         if ($same) { $skipped++; $skippedBytes += $entry.Length; continue }
         New-Item -ItemType Directory -Path (Split-Path -Parent $entry.TargetPath) -Force | Out-Null
         Copy-Item -LiteralPath $entry.SourcePath -Destination $entry.TargetPath -Force -ErrorAction Stop
+        try { (Get-Item -LiteralPath $entry.TargetPath -Force -ErrorAction Stop).LastWriteTimeUtc = $sourceItem.LastWriteTimeUtc } catch { }
         $copied++; $copiedBytes += $entry.Length
     }
     foreach ($item in ($existing | Sort-Object { $_.FullName.Length } -Descending)) {
