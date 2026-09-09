@@ -99,6 +99,41 @@ Describe 'Independent serviced and customized WinPE caches' {
     }
 }
 
+Describe 'Cached WIM artifact verification' {
+    BeforeEach {
+        Mock Write-BuildLog { }
+        $script:CachedWim = Join-Path $TestDrive 'cached.wim'
+        [IO.File]::WriteAllText($script:CachedWim, 'WIM-A')
+        $hash = (Get-FileHash -LiteralPath $script:CachedWim -Algorithm SHA256).Hash
+        [IO.File]::WriteAllText("$script:CachedWim.hash", $hash)
+    }
+    It 'skips the entire WIM read after a verified fast-refresh receipt is populated' {
+        Test-WinPECacheImage -Path $script:CachedWim -FastRefresh | Should -BeTrue
+        Mock Get-FileHash { throw 'Warm WIM verification must not read image bytes.' }
+        Test-WinPECacheImage -Path $script:CachedWim -FastRefresh | Should -BeTrue
+        Should -Invoke Get-FileHash -Times 0
+    }
+    It 'strict verification detects same-size same-timestamp corruption despite a warm receipt' {
+        Test-WinPECacheImage -Path $script:CachedWim -FastRefresh | Should -BeTrue
+        $stamp = (Get-Item -LiteralPath $script:CachedWim).LastWriteTimeUtc
+        [IO.File]::WriteAllText($script:CachedWim, 'WIM-B')
+        (Get-Item -LiteralPath $script:CachedWim).LastWriteTimeUtc = $stamp
+        Test-WinPECacheImage -Path $script:CachedWim | Should -BeFalse
+    }
+    It 'rehashes changed metadata and rejects corrupt WIM content in fast mode' {
+        Test-WinPECacheImage -Path $script:CachedWim -FastRefresh | Should -BeTrue
+        [IO.File]::AppendAllText($script:CachedWim, '-corrupt')
+        Test-WinPECacheImage -Path $script:CachedWim -FastRefresh | Should -BeFalse
+    }
+    It 'still requires the successful publication hash on warm fast hits' {
+        Test-WinPECacheImage -Path $script:CachedWim -FastRefresh | Should -BeTrue
+        [IO.File]::WriteAllText("$script:CachedWim.hash", ('F' * 64))
+        Test-WinPECacheImage -Path $script:CachedWim -FastRefresh | Should -BeFalse
+        Remove-Item -LiteralPath "$script:CachedWim.hash"
+        Test-WinPECacheImage -Path $script:CachedWim -FastRefresh | Should -BeFalse
+    }
+}
+
 Describe 'Content-aware direct media copying' {
     BeforeEach {
         Mock Write-BuildLog { }

@@ -52,6 +52,9 @@ function Hide-Console {
 
 trap {
     $failure = $_
+    Write-BootstrapLog "Unhandled failure: $($failure.Exception.Message)"
+    Write-BootstrapLog "Location: $($failure.InvocationInfo.PositionMessage)"
+    Write-BootstrapLog "Stack: $($failure.ScriptStackTrace)"
     try { Show-Console } catch { }
     try { Write-Log "AutoReset stopped: $($failure.Exception.Message)" 'ERROR' } catch { }
     try {
@@ -995,7 +998,6 @@ $splashForm.Tag.Controls.Add($lblSplash)
 Set-FormSize -Form $splashForm
 #--------------------------------------------------------------------
 $splashForm.Show()
-$splashForm.CenterToScreen()
 $splashForm.Activate()
 Update-Ui
 
@@ -1761,7 +1763,6 @@ $script:DeployStart   = Get-Date
 Set-FormSize -Form $form
 #--------------------------------------------------------------------
 $form.Show()
-$form.CenterToScreen()
 $form.Activate()
 Update-Ui
 

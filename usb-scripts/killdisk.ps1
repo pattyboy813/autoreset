@@ -36,8 +36,6 @@ if ($consoleHwnd -ne [IntPtr]::Zero) {
 }
 #-------------------------------------------------------------------
 
-[System.Windows.Forms.Application]::EnableVisualStyles()
-
 # ── Logging ──────────────────────────────────────────────────────────
 
 $logRoot = 'X:\Windows\Temp'
@@ -485,7 +483,6 @@ $dlgProgress.Tag.Controls.Add($statsPanel)
 
 Set-FormSize -Form $dlgProgress
 $dlgProgress.Show()
-$dlgProgress.CenterToScreen()
 [System.Windows.Forms.Application]::DoEvents()
 
 $wipeStart = Get-Date
@@ -682,6 +679,8 @@ exit 0
 }
 catch {
     Write-Log "Wipe stopped: $($_.Exception.Message)" 'ERROR'
+    Write-Log "Location: $($_.InvocationInfo.PositionMessage)" 'ERROR'
+    Write-Log "Stack: $($_.ScriptStackTrace)" 'ERROR'
     Save-WipeLog
     [void][Win32Console]::ShowWindow([Win32Console]::GetConsoleWindow(), 5)
     [void][System.Windows.Forms.MessageBox]::Show(

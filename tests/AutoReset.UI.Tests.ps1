@@ -10,6 +10,35 @@ Describe 'WinPE UI startup fallbacks' {
     It 'falls back to 100 percent scaling when graphics initialization fails' {
         $script:UiSource | Should -Match '(?s)\$graphics = \$null.*?catch \{ \$scale = 1\.0 \}.*?finally \{ if \(\$null -ne \$graphics\)'
     }
+    It 'centers forms through the public StartPosition property' {
+        $script:UiSource | Should -Match '\$form\.StartPosition\s*=\s*''CenterScreen'''
+    }
+    It 'never calls protected form-centering methods in <Name>' -ForEach @(
+        @{ Name = 'autoreset.ps1' }, @{ Name = 'killdisk.ps1' }, @{ Name = 'autoreset.ui.ps1' }
+    ) {
+        $path = Join-Path $PSScriptRoot "../usb-scripts/$Name"
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errors)
+        $errors.Count | Should -Be 0
+        # These .NET methods are protected: PowerShell cannot call them on a Form.
+        $calls = @($ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+            $node.Member.Value -in @('CenterToScreen', 'CenterToParent')
+        }, $true))
+        $calls.Count | Should -Be 0
+    }
+    It 'does not repeat optional visual-style initialization in KillDisk' {
+        $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../usb-scripts/killdisk.ps1') -Raw
+        $source | Should -Not -Match '::EnableVisualStyles\('
+    }
+    It 'records failure locations and stacks in <Name>' -ForEach @(
+        @{ Name = 'autoreset.ps1' }, @{ Name = 'killdisk.ps1' }
+    ) {
+        $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot "../usb-scripts/$Name") -Raw
+        $source | Should -Match 'Write-(BootstrapLog|Log) "Location: .*InvocationInfo\.PositionMessage'
+        $source | Should -Match 'Write-(BootstrapLog|Log) "Stack: .*ScriptStackTrace'
+    }
 }
 
 Describe 'WinForms disk layout' -Skip:($env:OS -ne 'Windows_NT') {
@@ -19,6 +48,7 @@ Describe 'WinForms disk layout' -Skip:($env:OS -ne 'Windows_NT') {
     It 'keeps one-disk rows visible and all content reachable' {
         $form = New-ResetForm -Title 'Layout test' -Width 800 -MinimumHeight 450
         try {
+            $form.StartPosition | Should -Be 'CenterScreen'
             $label = New-Object System.Windows.Forms.Label
             $label.AutoSize = $true
             $label.Text = ('A long safety warning with a model name. ' * 20)

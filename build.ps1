@@ -34,8 +34,9 @@
     customization. Identical warm builds skip mounting; script/config/tool changes
     customize the cached base without reinstalling packages or boot drivers.
     Cold builds commit and remount the base once, so may take longer than before.
-    USB payload images and driver archives copy directly from their original
-    locations, not through the workspace. ISO builds still materialize these files.
+    USB payload images, driver archives and final cached boot WIMs copy directly
+    from their original locations, not through the workspace. ISO builds still
+    materialize these files. Cached WIMs are never mounted or modified.
     Repeated builds trust unchanged size+timestamp metadata by default so large
     WIMs are not reread. Use -FastRefresh:$false for full SHA256 verification.
     WorkDir is a parent for a unique, builder-owned workspace; existing folders
@@ -83,8 +84,9 @@
 
 .PARAMETER FastRefresh
     Enabled by default. Unchanged size+timestamp files skip repeated SHA256 work
-    during cache planning and USB/ISO sync. Use -FastRefresh:$false when a full
-    byte-level verification of every unchanged file is required.
+    during cache planning, WIM/driver archive verification and USB/ISO sync.
+    Missing or changed metadata receipts require hashing. Use -FastRefresh:$false
+    when full byte-level verification, including driver sources, is required.
 
 .PARAMETER DriverCompression
     Fast (default) favors build time: LZMA2 level 1 or ZIP Fastest.
@@ -651,6 +653,8 @@ function Get-CachedFileHash {
     try { $receiptName = [BitConverter]::ToString($sha.ComputeHash($pathBytes)).Replace('-', '') + '.json' }
     finally { $sha.Dispose() }
     $receiptPath = Join-Path $ReceiptDirectory $receiptName
+    Assert-NoReparsePath -Path $ReceiptDirectory
+    Assert-NoReparsePath -Path $receiptPath
 
     if ($TrustMetadata -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
         try {
@@ -730,7 +734,7 @@ function Get-WinPECachePlan {
 }
 
 function Test-WinPECacheImage {
-    param([string]$Path)
+    param([string]$Path, [switch]$FastRefresh)
     Assert-NoReparsePath -Path $Path
     Assert-NoReparsePath -Path "$Path.hash"
     try {
@@ -738,7 +742,8 @@ function Test-WinPECacheImage {
             -not (Test-Path -LiteralPath "$Path.hash" -PathType Leaf)) { return $false }
         $stored = (Get-Content -LiteralPath "$Path.hash" -Raw -ErrorAction Stop).Trim()
         return $stored -match '^[0-9A-Fa-f]{64}$' -and
-            $stored -eq (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+            $stored -eq (Get-CachedFileHash -Path $Path `
+                -ReceiptDirectory (Join-Path (Split-Path -Parent $Path) 'ArtifactHashes') -TrustMetadata:$FastRefresh)
     }
     catch { Write-BuildLog "WIM cache MISS (unreadable receipt/image): $Path"; return $false }
 }
@@ -801,7 +806,7 @@ function Invoke-WinPEImageBuild {
     param($CachePlan, [string]$SourceWim, [string]$BootWim, [string]$MountPath,
         [string[]]$PackagePaths, [string]$DriverPath, [object[]]$RuntimeFiles,
         [string]$PayloadSource, [string]$BootsectSource, [string]$Resolution,
-        [int]$ScratchSpace = 512, [switch]$NoCache)
+        [int]$ScratchSpace = 512, [switch]$NoCache, [switch]$FastRefresh)
     if (-not (Test-PathWithin $BootWim $script:OwnedWorkspace) -or
         -not (Test-PathWithin $MountPath $script:OwnedWorkspace) -or
         (Test-PathWithin $CachePlan.BasePath $script:OwnedWorkspace) -or
@@ -810,8 +815,8 @@ function Invoke-WinPEImageBuild {
         throw 'WIM servicing requires an owned working copy, separate from source and caches.'
     }
     Start-BuildPhase 'hash/cache verification'
-    $finalHit = -not $NoCache -and (Test-WinPECacheImage -Path $CachePlan.FinalPath)
-    $baseHit = -not $NoCache -and -not $finalHit -and (Test-WinPECacheImage -Path $CachePlan.BasePath)
+    $finalHit = -not $NoCache -and (Test-WinPECacheImage -Path $CachePlan.FinalPath -FastRefresh:$FastRefresh)
+    $baseHit = -not $NoCache -and -not $finalHit -and (Test-WinPECacheImage -Path $CachePlan.BasePath -FastRefresh:$FastRefresh)
     Write-BuildLog ("WIM final cache {0}: {1}" -f $(if ($finalHit) { 'HIT' } else { 'MISS' }), $CachePlan.FinalKey)
     if (-not $finalHit) {
         Write-BuildLog ("WIM base cache {0}: {1}" -f $(if ($baseHit) { 'HIT' } else { 'MISS' }), $CachePlan.BaseKey)
@@ -820,10 +825,14 @@ function Invoke-WinPEImageBuild {
     Stop-BuildPhase 'hash/cache verification'
     Start-BuildPhase 'servicing'
     try {
-        $source = if ($finalHit) { $CachePlan.FinalPath } elseif ($baseHit) { $CachePlan.BasePath } else { $SourceWim }
+        if ($finalHit) {
+            # This source is consumed read-only by media sync; never mount or mutate the cache.
+            Write-StepSkipped 'Final WIM cache HIT (no staging copy, mounting or servicing)'
+            return $CachePlan.FinalPath
+        }
+        $source = if ($baseHit) { $CachePlan.BasePath } else { $SourceWim }
         Copy-Item -LiteralPath $source -Destination $BootWim -Force -ErrorAction Stop
         Set-ItemProperty -LiteralPath $BootWim -Name IsReadOnly -Value $false
-        if ($finalHit) { Write-StepSkipped 'Final WIM cache HIT (no mounting or servicing)'; return }
         $needsCleanup = $true
         try {
             Invoke-Tool -FilePath $script:DismPath -What 'Mount working boot.wim' -ArgumentList @(
@@ -853,6 +862,7 @@ function Invoke-WinPEImageBuild {
         }
         if (-not $NoCache) { Publish-WinPECacheImage -Source $BootWim -Destination $CachePlan.FinalPath }
         Write-StepDone 'Committed customized WinPE image'
+        return $BootWim
     }
     finally { Stop-BuildPhase 'servicing' }
 }
@@ -1321,9 +1331,12 @@ function Get-DriverSourceHash {
         if ($UseMetadataReceipt -and $cached.ContainsKey($relative)) {
             $hit = $cached[$relative]
             $cachedStamp = $null
-            try { $cachedStamp = [datetime]::Parse([string]$hit.LastWriteUtc).ToUniversalTime() } catch { }
+            try {
+                $cachedStamp = if ($hit.LastWriteUtc -is [datetime]) { $hit.LastWriteUtc.ToUniversalTime() }
+                    else { [datetime]::Parse([string]$hit.LastWriteUtc).ToUniversalTime() }
+            } catch { }
             if ([long]$hit.Length -eq $length -and $cachedStamp -and
-                [math]::Abs(($cachedStamp - $file.LastWriteTimeUtc).TotalSeconds) -le 2 -and
+                $cachedStamp.Ticks -eq $file.LastWriteTimeUtc.Ticks -and
                 "$($hit.Hash)" -match '^[0-9A-Fa-f]{64}$') {
                 $hash = [string]$hit.Hash
             }
@@ -1339,7 +1352,7 @@ function Get-DriverSourceHash {
         }) | Out-Null
         "$relative|$hash"
     }
-    if ($UseMetadataReceipt -and $ReceiptPath) {
+    if ($ReceiptPath) {
         $payload = [pscustomobject]@{
             Version = 1
             Files = $receiptFiles
@@ -1355,6 +1368,7 @@ function Invoke-DriverArchive {
         [Parameter(Mandatory)][string]$ArchiveDir,
         [string]$Label,
         [switch]$ForceRebuild,
+        [switch]$FastRefresh,
         [ValidateSet('Fast', 'Balanced', 'Maximum')]
         [string]$Compression = $(if ($DriverCompression) { $DriverCompression } else { 'Fast' })
     )
@@ -1389,7 +1403,8 @@ function Invoke-DriverArchive {
         Assert-NoReparsePath -Path $sevenZipPath
         (Get-FileHash -LiteralPath $sevenZipPath -Algorithm SHA256 -ErrorAction Stop).Hash
     } else { 'dotnet-zip' }
-    $sourceHash = Get-DriverSourceHash -SourcePath $SourcePath -Files $files -UseMetadataReceipt -ReceiptPath $sourceReceiptPath
+    New-Item -ItemType Directory -Path $ArchiveDir -Force -ErrorAction Stop | Out-Null
+    $sourceHash = Get-DriverSourceHash -SourcePath $SourcePath -Files $files -UseMetadataReceipt:$FastRefresh -ReceiptPath $sourceReceiptPath
     $currentHash = Get-BuildPartsHash -Parts @('driver-archive-v2', $sourceHash, $Compression, ($options -join ' '), $zipLevel, $extractorHash)
     if (-not $currentHash) { return $null }
 
@@ -1397,7 +1412,7 @@ function Invoke-DriverArchive {
         $storedHash = ''
         try { $storedHash = (Get-Content -LiteralPath $hashPath -Raw -ErrorAction Stop).Trim() }
         catch { Write-BuildLog "Driver cache MISS (unreadable receipt): $archivePath" }
-        $expectedHash = "$currentHash|$((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash)"
+        $expectedHash = "$currentHash|$(Get-CachedFileHash -Path $archivePath -ReceiptDirectory (Join-Path $ArchiveDir 'ArtifactHashes') -TrustMetadata:$FastRefresh)"
         if ($storedHash -eq $expectedHash) {
             $sizeMB = [math]::Round((Get-Item $archivePath).Length / 1MB, 0)
             Write-StepSkipped "Drivers ($Label): archive current ($sizeMB MB, no changes)"
@@ -1407,7 +1422,6 @@ function Invoke-DriverArchive {
     }
     Write-BuildLog "Driver cache MISS: $archivePath ($Compression)"
 
-    New-Item -ItemType Directory -Path $ArchiveDir -Force | Out-Null
     New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
 
     $uncompressedMB = [math]::Round(($files | Measure-Object -Property Length -Sum).Sum / 1MB, 0)
@@ -1438,7 +1452,7 @@ function Invoke-DriverArchive {
     }
 
     Move-Item -LiteralPath $stagingArchive -Destination $archivePath -Force
-    Set-Content -LiteralPath $hashPath -Value "$currentHash|$((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash)" -Encoding UTF8
+    Set-Content -LiteralPath $hashPath -Value "$currentHash|$(Get-CachedFileHash -Path $archivePath -ReceiptDirectory (Join-Path $ArchiveDir 'ArtifactHashes'))" -Encoding UTF8
 
     $compressedMB = [math]::Round((Get-Item $archivePath).Length / 1MB, 0)
     $ratio = if ($uncompressedMB -gt 0) { [math]::Round((1 - $compressedMB / $uncompressedMB) * 100, 0) } else { 0 }
@@ -1575,7 +1589,7 @@ function Invoke-DriverPreparation {
             throw "Driver folder not found: $source"
         }
         $result = Invoke-DriverArchive -SourcePath $source -ArchiveDir $archiveDir `
-            -Label $Device -ForceRebuild:$Force
+            -Label $Device -ForceRebuild:$Force -FastRefresh:$FastRefresh
         if (-not $result) { throw "No driver files found under $source." }
     }
     else {
@@ -1583,7 +1597,7 @@ function Invoke-DriverPreparation {
             Sort-Object Name)
         if ($modelFolders.Count -eq 0) {
             $result = Invoke-DriverArchive -SourcePath $driversRoot -ArchiveDir $preparedDriversRoot `
-                -Label 'all' -ForceRebuild:$Force
+                -Label 'all' -ForceRebuild:$Force -FastRefresh:$FastRefresh
             if (-not $result) { throw "No driver files found under $driversRoot." }
         }
         else {
@@ -1591,7 +1605,7 @@ function Invoke-DriverPreparation {
             foreach ($modelFolder in $modelFolders) {
                 $archiveDir = Join-Path $preparedDriversRoot $modelFolder.Name
                 $result = Invoke-DriverArchive -SourcePath $modelFolder.FullName -ArchiveDir $archiveDir `
-                    -Label $modelFolder.Name -ForceRebuild:$Force
+                    -Label $modelFolder.Name -ForceRebuild:$Force -FastRefresh:$FastRefresh
                 if ($result) { $built++ }
             }
             if ($built -eq 0) { throw "No driver files found under $driversRoot." }
@@ -1997,9 +2011,9 @@ foreach ($helper in @('Sync-RuntimePayload', 'Copy-RuntimeScript', 'Copy-Changed
 $cachePlan = Get-WinPECachePlan -CacheDirectory $cacheDir -BaseParts $baseParts -RuntimeParts $runtimeParts
 Write-StepDone 'Checked build cache inputs'
 Stop-BuildPhase 'hash/cache keys'
-Invoke-WinPEImageBuild -CachePlan $cachePlan -SourceWim $srcWinpeWim -BootWim $bootWim -MountPath $mountDir `
+$bootWimSource = Invoke-WinPEImageBuild -CachePlan $cachePlan -SourceWim $srcWinpeWim -BootWim $bootWim -MountPath $mountDir `
     -PackagePaths $packagePaths -DriverPath $winpeDrivers -RuntimeFiles $runtimeFiles -PayloadSource $payloadSrc `
-    -BootsectSource $bootsect -Resolution $WinPEResolution -ScratchSpace 512 -NoCache:$NoCache
+    -BootsectSource $bootsect -Resolution $WinPEResolution -ScratchSpace 512 -NoCache:$NoCache -FastRefresh:$FastRefresh
 
 # ── Step 6: Sync payload ────────────────────────────────────────────
 
@@ -2035,7 +2049,7 @@ if (-not $SkipPayload) {
             Sort-Object Name)
 
         if ($modelFolders.Count -eq 0) {
-            $archive = Invoke-DriverArchive -SourcePath $driversSrc -ArchiveDir $preparedDriversRoot -Label 'all'
+            $archive = Invoke-DriverArchive -SourcePath $driversSrc -ArchiveDir $preparedDriversRoot -Label 'all' -FastRefresh:$FastRefresh
             if ($archive) {
                 $externalPayloadFiles += [pscustomobject]@{
                     RelativePath = "Drivers/$(Split-Path -Leaf $archive)"
@@ -2051,7 +2065,7 @@ if (-not $SkipPayload) {
                 $modelName   = $modelFolder.Name
                 $archiveDir  = Join-Path $preparedDriversRoot $modelName
                 $archive = Invoke-DriverArchive -SourcePath $modelFolder.FullName `
-                    -ArchiveDir $archiveDir -Label $modelName
+                    -ArchiveDir $archiveDir -Label $modelName -FastRefresh:$FastRefresh
                 if ($archive) {
                     $externalPayloadFiles += [pscustomobject]@{
                         RelativePath = "Drivers/$modelName/$(Split-Path -Leaf $archive)"
@@ -2069,11 +2083,18 @@ if (-not $SkipPayload) {
 
 # ── Step 7: Output (ISO / USB update / USB fresh) ───────────────────
 
-$bootFiles = @(Get-MediaFileInventory -Root $mediaDir -ExcludePayload)
+$bootWimFile = [pscustomobject]@{
+    RelativePath = 'sources/boot.wim'; Length = (Get-Item -LiteralPath $bootWimSource).Length; SourcePath = $bootWimSource
+}
+$bootFiles = @(Get-MediaFileInventory -Root $mediaDir -ExcludePayload |
+    Where-Object { $_.RelativePath -ne 'sources/boot.wim' }) + @($bootWimFile)
 $payloadFiles = @(Get-MediaFileInventory -Root $mediaPayload) + $externalPayloadFiles
 Start-BuildPhase 'output'
 
 if ($PSCmdlet.ParameterSetName -eq 'ISO') {
+    if ($bootWimSource -ne $bootWim) {
+        Sync-BuildFiles -Files @($bootWimFile) -Destination $mediaDir -FastRefresh:$FastRefresh
+    }
     Start-BuildPhase 'copy ISO payload'
     Sync-BuildFiles -Files $externalPayloadFiles -Destination $mediaPayload -FastRefresh:$FastRefresh
     Stop-BuildPhase 'copy ISO payload'

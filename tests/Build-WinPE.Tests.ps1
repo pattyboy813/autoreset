@@ -414,13 +414,64 @@ Describe 'Content-based cache and archive refresh' {
         finally { $zip.Dispose() }
     }
     It 'reuses driver source hash receipts for unchanged files' {
-        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh
         Test-Path -LiteralPath "$archive.source.json" | Should -BeTrue
         Mock Get-FileHash { throw 'Source hash should be reused from receipt.' } -ParameterFilter {
             $LiteralPath -eq $script:DriverFile
         }
-        { Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir } | Should -Not -Throw
+        { Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh } | Should -Not -Throw
         Should -Invoke Get-FileHash -Times 0 -ParameterFilter { $LiteralPath -eq $script:DriverFile }
+    }
+    It 'creates the archive directory before writing the first source receipt' {
+        Remove-Item -LiteralPath $script:ArchiveDir -Recurse -Force
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh -ErrorAction Stop
+        Test-Path -LiteralPath "$archive.source.json" | Should -BeTrue
+        Test-Path -LiteralPath "$archive.hash" | Should -BeTrue
+    }
+    It 'skips both source and archive reads on an unchanged fast refresh' {
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh
+        Mock Get-FileHash { throw 'Unchanged source and archive bytes must not be read.' }
+        Mock Move-Item { throw 'An unchanged archive must not be rebuilt.' }
+        Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh | Should -Be $archive
+        Should -Invoke Get-FileHash -Times 0
+        Should -Invoke Move-Item -Times 0
+    }
+    It 'strict refresh detects source changes hidden by matching metadata receipts' {
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh
+        $stamp = (Get-Item -LiteralPath $script:DriverFile).LastWriteTimeUtc
+        [IO.File]::WriteAllText($script:DriverFile, 'BBBB')
+        (Get-Item -LiteralPath $script:DriverFile).LastWriteTimeUtc = $stamp
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh:$false
+        $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+        $reader = [IO.StreamReader]::new($zip.GetEntry('driver.inf').Open())
+        try { $reader.ReadToEnd() | Should -Be 'BBBB' }
+        finally { $reader.Dispose(); $zip.Dispose() }
+        Mock Get-FileHash { throw 'Strict verification must refresh receipts for subsequent fast builds.' }
+        Mock Move-Item { throw 'A fast build following strict verification must reuse the archive.' }
+        Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh | Should -Be $archive
+        Should -Invoke Get-FileHash -Times 0
+        Should -Invoke Move-Item -Times 0
+    }
+    It 'rehashes driver sources even for timestamp changes smaller than two seconds' {
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh
+        $stamp = (Get-Item -LiteralPath $script:DriverFile).LastWriteTimeUtc
+        [IO.File]::WriteAllText($script:DriverFile, 'BBBB')
+        (Get-Item -LiteralPath $script:DriverFile).LastWriteTimeUtc = $stamp.AddSeconds(1)
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh
+        $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+        $reader = [IO.StreamReader]::new($zip.GetEntry('driver.inf').Open())
+        try { $reader.ReadToEnd() | Should -Be 'BBBB' }
+        finally { $reader.Dispose(); $zip.Dispose() }
+    }
+    It 'strict refresh detects archive corruption hidden by matching metadata receipts' {
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh
+        $stamp = (Get-Item -LiteralPath $archive).LastWriteTimeUtc
+        $bytes = [IO.File]::ReadAllBytes($archive)
+        $bytes[0] = $bytes[0] -bxor 1
+        [IO.File]::WriteAllBytes($archive, $bytes)
+        (Get-Item -LiteralPath $archive).LastWriteTimeUtc = $stamp
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh:$false
+        [IO.File]::ReadAllBytes($archive)[0] | Should -Be 0x50
     }
     It 'rejects non-Windows and non-AMD64 extractors before executing them' {
         Mock Invoke-Tool { }
@@ -603,7 +654,7 @@ Describe 'Two-level WIM servicing integration with mocked DISM' {
         Mock Set-WinPEStartup { }
     }
     It 'publishes a dismounted base before runtime customization, preserving package order and boot drivers' {
-        @(Invoke-WinPEImageBuild @script:BuildArgs).Count | Should -Be 0
+        Invoke-WinPEImageBuild @script:BuildArgs | Should -Be $script:WorkingWim
         Test-WinPECacheImage $script:Plan.BasePath | Should -BeTrue
         Test-WinPECacheImage $script:Plan.FinalPath | Should -BeTrue
         [IO.File]::ReadAllText($script:Plan.BasePath) | Should -Not -Match 'runtime'
@@ -621,6 +672,20 @@ Describe 'Two-level WIM servicing integration with mocked DISM' {
         Should -Invoke Invoke-Tool -Times 3 -Exactly -ParameterFilter { $ArgumentList -contains '/Add-Package' }
         Should -Invoke Sync-RuntimePayload -Times 1 -Exactly
         Should -Invoke Write-BuildLog -Times 1 -Exactly -ParameterFilter { $Text -like 'WIM final cache HIT*' }
+    }
+    It 'returns the final cache as a read-only media source without staging or servicing' {
+        Publish-WinPECacheImage -Source $script:SourceWim -Destination $script:Plan.FinalPath
+        Test-WinPECacheImage -Path $script:Plan.FinalPath -FastRefresh | Should -BeTrue
+        Mock Copy-Item { throw 'A final cache hit must not stage a WIM.' }
+        Mock Set-ItemProperty { throw 'A final cache hit must not change WIM attributes.' }
+        Mock Invoke-Tool { throw 'A final cache hit must not mount or service a WIM.' }
+        Mock Get-FileHash { throw 'An unchanged fast cache hit must not hash WIM bytes.' }
+        Invoke-WinPEImageBuild @script:BuildArgs -FastRefresh | Should -Be $script:Plan.FinalPath
+        Test-Path -LiteralPath $script:WorkingWim | Should -BeFalse
+        Should -Invoke Copy-Item -Times 0
+        Should -Invoke Set-ItemProperty -Times 0
+        Should -Invoke Invoke-Tool -Times 0
+        Should -Invoke Get-FileHash -Times 0
     }
     It 'customizes a runtime-only change from the base without reinstalling packages or drivers' {
         Invoke-WinPEImageBuild @script:BuildArgs
@@ -858,6 +923,24 @@ Describe 'Build orchestration regression guards' {
         $parameter.DefaultValue.Extent.Text | Should -Be '$true'
         $source = $script:BuilderAst.Extent.Text
         $source | Should -Match 'Get-CachedFileHash -Path \$srcWinpeWim.*-TrustMetadata:\$FastRefresh'
+    }
+    It 'explicitly propagates the refresh policy to every WIM and driver archive build' {
+        $calls = $script:BuilderAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -in @('Invoke-WinPEImageBuild', 'Invoke-DriverArchive')
+        }, $true)
+        $calls.Count | Should -Be 6
+        foreach ($call in $calls) {
+            $call.Extent.Text | Should -Match '-FastRefresh:\$FastRefresh'
+        }
+    }
+    It 'inventories the returned WIM source for USB capacity checks and stages it for ISO only' {
+        $source = $script:BuilderAst.Extent.Text
+        $source | Should -Match '\$bootWimSource = Invoke-WinPEImageBuild'
+        $source | Should -Match 'RelativePath = ''sources/boot.wim''; Length = \(Get-Item -LiteralPath \$bootWimSource\).Length; SourcePath = \$bootWimSource'
+        $source | Should -Match '(?s)\$bootFiles = @\(Get-MediaFileInventory.*?Where-Object \{ \$_.RelativePath -ne ''sources/boot.wim'' \}\) \+ @\(\$bootWimFile\)'
+        $source | Should -Match '(?s)if \(\$PSCmdlet.ParameterSetName -eq ''ISO''\) \{\s+if \(\$bootWimSource -ne \$bootWim\) \{\s+Sync-BuildFiles -Files @\(\$bootWimFile\) -Destination \$mediaDir'
     }
     It 'injects boot drivers for ISO and USB, not just USB' {
         $calls = $script:BuilderAst.FindAll({
