@@ -80,6 +80,11 @@
 .PARAMETER NoCache
     Bypass both serviced-base and customized-final WIM caches (reads and writes).
 
+.PARAMETER FastRefresh
+    Faster USB/ISO file sync: if size and timestamp already match, skip SHA256
+    compare and trust metadata. This is quicker but less strict than full hash
+    verification.
+
 .PARAMETER DriverCompression
     Fast (default) favors build time: LZMA2 level 1 or ZIP Fastest.
     Balanced uses LZMA2 level 5; Maximum uses level 9 with a larger dictionary.
@@ -131,6 +136,8 @@ param(
     [switch]$UpdateUsb,
 
     [switch]$NoCache,
+
+    [switch]$FastRefresh,
 
     [ValidateSet('Fast', 'Balanced', 'Maximum')]
     [string]$DriverCompression = 'Fast',
@@ -611,9 +618,9 @@ function Get-ValidatedUsbVolumes {
     if ($bootPart.Count -ne 1 -or $payloadPart.Count -ne 1 -or
         $bootPart[0].DiskNumber -ne $payloadPart[0].DiskNumber -or
         $bootPart[0].PartitionNumber -eq $payloadPart[0].PartitionNumber -or
-        $bootPart[0].IsReadOnly -ne $false -or $payloadPart[0].IsReadOnly -ne $false -or
-        $bootPart[0].IsBoot -ne $false -or $payloadPart[0].IsBoot -ne $false -or
-        $bootPart[0].IsSystem -ne $false -or $payloadPart[0].IsSystem -ne $false) {
+        $bootPart[0].IsReadOnly -eq $true -or $payloadPart[0].IsReadOnly -eq $true -or
+        $bootPart[0].IsBoot -eq $true -or $payloadPart[0].IsBoot -eq $true -or
+        $bootPart[0].IsSystem -eq $true -or $payloadPart[0].IsSystem -eq $true) {
         throw 'PE and PAYLOAD must be writable, distinct partitions on the same physical USB disk.'
     }
     $disk = Assert-BuildDiskSafe -DiskNumber $bootPart[0].DiskNumber `
@@ -886,7 +893,9 @@ function Assert-BuildPayload {
     param([string]$PayloadSource, [string]$InstallImage, [switch]$BootOnly)
     $config = Join-Path $PayloadSource 'reset.json'
     if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { throw "Required configuration missing: $config" }
-    Assert-NoReparsePath -Path $PayloadSource -Recurse
+    # Startup preflight should stay responsive on large/synced roots.
+    # Deep reparse scans are performed later on concrete copy/hash trees.
+    Assert-NoReparsePath -Path $PayloadSource
     $settings = Get-Content -LiteralPath $config -Raw | ConvertFrom-Json -ErrorAction Stop
     if (-not $settings -or $settings -is [array] -or $settings -isnot [pscustomobject]) {
         throw 'reset.json must contain a configuration object.'
@@ -979,6 +988,7 @@ function Sync-BuildFiles {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Files,
         [Parameter(Mandatory)][string]$Destination,
+        [switch]$FastRefresh,
         [switch]$Mirror,
         [string[]]$PreserveDirectories = @('Logs')
     )
@@ -1046,13 +1056,26 @@ function Sync-BuildFiles {
         $existing = @(Get-ChildItem -LiteralPath $destRoot -Recurse -Force -ErrorAction Stop)
     }
     $copied = 0L; $skipped = 0L; $copiedBytes = 0L; $skippedBytes = 0L
+    $totalFiles = $plan.Count
+    $currentFile = 0
     foreach ($entry in $plan) {
+        $currentFile++
+        if (($currentFile -eq 1) -or ($currentFile -eq $totalFiles) -or (($currentFile % 20) -eq 0)) {
+            $percent = [int][math]::Floor((100 * $currentFile) / [math]::Max(1, $totalFiles))
+            Update-StepDisplay $percent
+        }
         $same = $false
         if (Test-Path -LiteralPath $entry.TargetPath -PathType Leaf) {
-            $same = (Get-Item -LiteralPath $entry.TargetPath -Force -ErrorAction Stop).Length -eq $entry.Length
-            if ($same) {
-                $same = (Get-FileHash -LiteralPath $entry.SourcePath -Algorithm SHA256 -ErrorAction Stop).Hash -eq
-                    (Get-FileHash -LiteralPath $entry.TargetPath -Algorithm SHA256 -ErrorAction Stop).Hash
+            $target = Get-Item -LiteralPath $entry.TargetPath -Force -ErrorAction Stop
+            if ($target.Length -eq $entry.Length) {
+                if ($FastRefresh) {
+                    $source = Get-Item -LiteralPath $entry.SourcePath -Force -ErrorAction Stop
+                    $same = [math]::Abs(($source.LastWriteTimeUtc - $target.LastWriteTimeUtc).TotalSeconds) -le 2
+                }
+                if (-not $same) {
+                    $same = (Get-FileHash -LiteralPath $entry.SourcePath -Algorithm SHA256 -ErrorAction Stop).Hash -eq
+                        (Get-FileHash -LiteralPath $entry.TargetPath -Algorithm SHA256 -ErrorAction Stop).Hash
+                }
             }
         }
         if ($same) { $skipped++; $skippedBytes += $entry.Length; continue }
@@ -1198,17 +1221,67 @@ function Assert-RuntimeExtractor {
 # ── Driver archive change detection ─────────────────────────────────
 
 function Get-DriverSourceHash {
-    param([Parameter(Mandatory)][string]$SourcePath, [object[]]$Files)
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [object[]]$Files,
+        [switch]$UseMetadataReceipt,
+        [string]$ReceiptPath
+    )
     if (-not $PSBoundParameters.ContainsKey('Files')) {
         Assert-NoReparsePath -Path $SourcePath -Recurse
         $Files = @(Get-ChildItem -LiteralPath $SourcePath -Recurse -File -Force -ErrorAction Stop |
             Where-Object { $_.Name -notin @('Drivers.zip', 'Drivers.7z', 'Drivers.7z.hash', 'Drivers.zip.hash') })
     }
     if ($Files.Count -eq 0) { return $null }
+    $cached = @{}
+    if ($UseMetadataReceipt -and $ReceiptPath -and (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) {
+        try {
+            $receipt = ConvertFrom-Json (Get-Content -LiteralPath $ReceiptPath -Raw -ErrorAction Stop)
+            if ($receipt -and $receipt.Version -eq 1 -and $receipt.Files) {
+                foreach ($item in $receipt.Files) {
+                    if (-not $item.RelativePath -or -not $item.Hash) { continue }
+                    $cached[[string]$item.RelativePath] = $item
+                }
+            }
+        }
+        catch {
+            Write-BuildLog "Driver source hash receipt unreadable; recalculating: $ReceiptPath"
+        }
+    }
     $root = [IO.Path]::GetFullPath($SourcePath).TrimEnd('\', '/')
+    $receiptFiles = New-Object System.Collections.Generic.List[object]
     $parts = foreach ($file in ($Files | Sort-Object FullName)) {
         $relative = $file.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
-        "$relative|$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
+        $lastWrite = $file.LastWriteTimeUtc.ToString('o')
+        $length = [long]$file.Length
+        $hash = $null
+        if ($UseMetadataReceipt -and $cached.ContainsKey($relative)) {
+            $hit = $cached[$relative]
+            $cachedStamp = $null
+            try { $cachedStamp = [datetime]::Parse([string]$hit.LastWriteUtc).ToUniversalTime() } catch { }
+            if ([long]$hit.Length -eq $length -and $cachedStamp -and
+                [math]::Abs(($cachedStamp - $file.LastWriteTimeUtc).TotalSeconds) -le 2 -and
+                "$($hit.Hash)" -match '^[0-9A-Fa-f]{64}$') {
+                $hash = [string]$hit.Hash
+            }
+        }
+        if (-not $hash) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        }
+        $receiptFiles.Add([pscustomobject]@{
+            RelativePath = $relative
+            Length = $length
+            LastWriteUtc = $lastWrite
+            Hash = $hash
+        }) | Out-Null
+        "$relative|$hash"
+    }
+    if ($UseMetadataReceipt -and $ReceiptPath) {
+        $payload = [pscustomobject]@{
+            Version = 1
+            Files = $receiptFiles
+        }
+        Set-Content -LiteralPath $ReceiptPath -Value ($payload | ConvertTo-Json -Depth 4) -Encoding UTF8
     }
     return Get-BuildPartsHash -Parts $parts
 }
@@ -1236,8 +1309,9 @@ function Invoke-DriverArchive {
     $archiveExt   = if ($use7z) { '7z' } else { 'zip' }
     $archivePath  = Join-Path $ArchiveDir "Drivers.$archiveExt"
     $hashPath     = "$archivePath.hash"
+    $sourceReceiptPath = "$archivePath.source.json"
     $staleExt = if ($use7z) { 'zip' } else { '7z' }
-    foreach ($stale in @("Drivers.$staleExt", "Drivers.$staleExt.hash")) {
+    foreach ($stale in @("Drivers.$staleExt", "Drivers.$staleExt.hash", "Drivers.$staleExt.source.json")) {
         $stalePath = Join-Path $ArchiveDir $stale
         if (Test-Path -LiteralPath $stalePath) { Remove-Item -LiteralPath $stalePath -Force -ErrorAction Stop }
     }
@@ -1252,7 +1326,7 @@ function Invoke-DriverArchive {
         Assert-NoReparsePath -Path $sevenZipPath
         (Get-FileHash -LiteralPath $sevenZipPath -Algorithm SHA256 -ErrorAction Stop).Hash
     } else { 'dotnet-zip' }
-    $sourceHash = Get-DriverSourceHash -SourcePath $SourcePath -Files $files
+    $sourceHash = Get-DriverSourceHash -SourcePath $SourcePath -Files $files -UseMetadataReceipt -ReceiptPath $sourceReceiptPath
     $currentHash = Get-BuildPartsHash -Parts @('driver-archive-v2', $sourceHash, $Compression, ($options -join ' '), $zipLevel, $extractorHash)
     if (-not $currentHash) { return $null }
 
@@ -1692,9 +1766,9 @@ $externalInstallWim = Join-Path $preparedImagesRoot 'install.wim'
 $localInstallWim = Join-Path $payloadSrc 'win-images\install.wim'
 $installWim = if (Test-Path -LiteralPath $externalInstallWim -PathType Leaf) { $externalInstallWim } else { $localInstallWim }
 Assert-BuildPayload -PayloadSource $payloadSrc -InstallImage $installWim -BootOnly:$SkipPayload
-Assert-NoReparsePath -Path $cacheDir -Recurse
-Assert-NoReparsePath -Path $preparedDriversRoot -Recurse
-Assert-NoReparsePath -Path (Join-Path $ScriptRoot 'winpe-drivers') -Recurse
+Assert-NoReparsePath -Path $cacheDir
+Assert-NoReparsePath -Path $preparedDriversRoot
+Assert-NoReparsePath -Path (Join-Path $ScriptRoot 'winpe-drivers')
 $runtimeExtractorPath = Join-Path $payloadSrc 'tools\7za.exe'
 $script:RuntimeExtractor = if (Test-Path -LiteralPath $runtimeExtractorPath -PathType Leaf) {
     Assert-RuntimeExtractor -Path $runtimeExtractorPath
@@ -1762,6 +1836,9 @@ if (-not $BuildIso) {
 if ($ScriptRoot -like '*OneDrive*') {
     Write-Aside "This folder is inside OneDrive. Work folder moved to $WorkDir to avoid sync issues."
     Write-Aside 'Consider moving the whole kit to a plain local folder like C:\AutoReset.'
+}
+if ($FastRefresh) {
+    Write-Aside 'FastRefresh enabled: unchanged size+timestamp files skip SHA256 verification for quicker sync.'
 }
 
 # ── Step 2: Prepare work folder ─────────────────────────────────────
@@ -1929,7 +2006,7 @@ Start-BuildPhase 'output'
 
 if ($PSCmdlet.ParameterSetName -eq 'ISO') {
     Start-BuildPhase 'copy ISO payload'
-    Sync-BuildFiles -Files $externalPayloadFiles -Destination $mediaPayload
+    Sync-BuildFiles -Files $externalPayloadFiles -Destination $mediaPayload -FastRefresh:$FastRefresh
     Stop-BuildPhase 'copy ISO payload'
     if (-not (Test-Path -LiteralPath $oscdimg)) {
         throw "oscdimg.exe not found at $oscdimg. Install the ADK Deployment Tools and retry."
@@ -1989,7 +2066,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'USBUPDATE') {
     }
 
     Start-BuildPhase 'copy USB refresh'
-    Sync-BuildFiles -Files $bootFiles -Destination $bootDrive
+    Sync-BuildFiles -Files $bootFiles -Destination $bootDrive -FastRefresh:$FastRefresh
     $currentVolumes = Get-ValidatedUsbVolumes -ProtectedDiskNumbers $protectedDisks -ExpectedIdentity $targetIdentity
     Assert-UsbPayloadOwnership -Volume $currentVolumes.Payload
     if ($currentVolumes.Boot.DriveLetter -ne $bootVol.DriveLetter -or
@@ -1997,7 +2074,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'USBUPDATE') {
         $currentVolumes.Disk.Number -ne $targetNumber) {
         throw 'USB partition mapping changed during the refresh.'
     }
-    Sync-BuildFiles -Files $payloadFiles -Destination (Join-Path $payloadDrive 'Payload') -Mirror -PreserveDirectories @('Logs')
+    Sync-BuildFiles -Files $payloadFiles -Destination (Join-Path $payloadDrive 'Payload') -FastRefresh:$FastRefresh -Mirror -PreserveDirectories @('Logs')
     Stop-BuildPhase 'copy USB refresh'
     Write-StepDone 'Refreshed existing deployment stick'
     Write-Host ''
@@ -2051,7 +2128,7 @@ else {
         -ProtectedDiskNumbers $protectedDisks -AllowNonUsb:$AllowNonUsbDisk
     Assert-BuildPartitionMapping -DiskNumber $UsbDiskNumber -PartitionNumber $bootPart.PartitionNumber -DriveLetter $bootLetter
     Start-BuildPhase 'copy USB boot'
-    Sync-BuildFiles -Files $bootFiles -Destination $bootDrive
+    Sync-BuildFiles -Files $bootFiles -Destination $bootDrive -FastRefresh:$FastRefresh
     Stop-BuildPhase 'copy USB boot'
     Write-StepDone "Copied boot files to $bootLetter`:"
 
@@ -2060,7 +2137,7 @@ else {
         -ProtectedDiskNumbers $protectedDisks -AllowNonUsb:$AllowNonUsbDisk
     Assert-BuildPartitionMapping -DiskNumber $UsbDiskNumber -PartitionNumber $payloadPart.PartitionNumber -DriveLetter $payloadLetter
     Start-BuildPhase 'copy USB payload'
-    Sync-BuildFiles -Files $payloadFiles -Destination (Join-Path $payloadDrive 'Payload') -Mirror -PreserveDirectories @('Logs')
+    Sync-BuildFiles -Files $payloadFiles -Destination (Join-Path $payloadDrive 'Payload') -FastRefresh:$FastRefresh -Mirror -PreserveDirectories @('Logs')
     Stop-BuildPhase 'copy USB payload'
     Write-StepDone "Copied payload to $payloadLetter`:"
 

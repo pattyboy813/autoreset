@@ -47,4 +47,13 @@ Describe 'WinForms disk layout' -Skip:($env:OS -ne 'Windows_NT') {
         }
         finally { $form.Dispose() }
     }
+    It 'keeps compact form targets when a smaller width is requested' {
+        $form = New-ResetForm -Title 'Compact test' -Width 500
+        try {
+            $form._TargetWidth | Should -Be 500
+            Set-FormSize -Form $form
+            $form.ClientSize.Width | Should -BeLessOrEqual ([int](500 * $form._UiScale))
+        }
+        finally { $form.Dispose() }
+    }
 }

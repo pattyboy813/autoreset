@@ -432,7 +432,7 @@ while (-not $confirmed) {
 
 # ── Wipe progress ───────────────────────────────────────────────────
 
-$dlgProgress = New-WipeForm -Title 'Wiping Disk(s)' -Width 500
+$dlgProgress = New-WipeForm -Title 'Wiping Disk(s)' -Width 500 -MinimumHeight 120
 
 $lblCurrent             = New-Object System.Windows.Forms.Label
 $lblCurrent.Text        = 'Preparing...'
@@ -485,6 +485,7 @@ $dlgProgress.Tag.Controls.Add($statsPanel)
 
 Set-FormSize -Form $dlgProgress
 $dlgProgress.Show()
+$dlgProgress.CenterToScreen()
 [System.Windows.Forms.Application]::DoEvents()
 
 $wipeStart = Get-Date
@@ -536,6 +537,7 @@ exit
 
     # DiskPart clean all does not supply a reliable percentage or time estimate.
     $pbWipe.Style = 'Marquee'
+    $pbWipe.MarqueeAnimationSpeed = 30
 
     $readTask = $stream.ReadAsync($buffer, 0, $buffer.Length)
     while ($true) {
@@ -574,6 +576,7 @@ exit
 
     $proc.Dispose()
     $pbWipe.Style = 'Continuous'
+    $pbWipe.MarqueeAnimationSpeed = 0
     $pbWipe.Value = [math]::Min($pbWipe.Maximum, $diskIndex * 100)
 
     $wipeResults += [pscustomobject]@{

@@ -16,6 +16,25 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+$bootstrapRoot = 'X:\Windows\Temp'
+if (-not (Test-Path -LiteralPath $bootstrapRoot)) {
+    $bootstrapRoot = $env:TEMP
+    if ([string]::IsNullOrWhiteSpace($bootstrapRoot)) {
+        $bootstrapRoot = [System.IO.Path]::GetTempPath().TrimEnd('\', '/')
+    }
+}
+$script:BootstrapLog = Join-Path $bootstrapRoot 'AutoReset-Bootstrap.log'
+function Write-BootstrapLog {
+    param([Parameter(Mandatory)][string]$Message)
+    try {
+        Add-Content -LiteralPath $script:BootstrapLog -Value (
+            '{0}  {1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $Message
+        ) -ErrorAction SilentlyContinue
+    }
+    catch { }
+}
+Write-BootstrapLog "Startup begin: $PSCommandPath"
+
 trap {
     $failure = $_
     try { Show-Console } catch { }
@@ -29,14 +48,33 @@ trap {
     exit 1
 }
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+try {
+    Write-BootstrapLog 'Loading WinForms assemblies.'
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
 
-. (Join-Path $PSScriptRoot 'autoreset.common.ps1')
-. (Join-Path $PSScriptRoot 'autoreset.ui.ps1')
-Assert-WinPEEnvironment
+    Write-BootstrapLog 'Loading shared AutoReset scripts.'
+    . (Join-Path $PSScriptRoot 'autoreset.common.ps1')
+    . (Join-Path $PSScriptRoot 'autoreset.ui.ps1')
+    Assert-WinPEEnvironment
 
-[System.Windows.Forms.Application]::EnableVisualStyles()
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+    Write-BootstrapLog 'Startup initialization complete.'
+}
+catch {
+    Write-BootstrapLog "Startup initialization failed: $($_.Exception.Message)"
+    Write-BootstrapLog "Line: $($_.InvocationInfo.ScriptLineNumber)"
+    try {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "AutoReset failed before the Preparing screen.`r`n`r`n$($_.Exception.Message)`r`n`r`nBootstrap log: $($script:BootstrapLog)",
+            'AutoReset startup error', 'OK', 'Error')
+    }
+    catch {
+        Write-Host "AutoReset startup failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Bootstrap log: $($script:BootstrapLog)" -ForegroundColor Yellow
+    }
+    exit 1
+}
 
 $script:Version = '2.0.0'
 
@@ -506,6 +544,46 @@ function Invoke-KillDiskProcess {
     }
 }
 
+function Stage-KillDiskRuntime {
+    param([Parameter(Mandatory)][string[]]$SourceRoots)
+    $required = @(
+        'Scripts\killdisk.ps1',
+        'Scripts\autoreset.common.ps1',
+        'Scripts\autoreset.ui.ps1'
+    )
+    $resolved = @{}
+    foreach ($relative in $required) {
+        foreach ($root in $SourceRoots) {
+            if (-not $root) { continue }
+            $candidate = Join-Path $root $relative
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $resolved[$relative] = $candidate
+                break
+            }
+        }
+        if (-not $resolved.ContainsKey($relative)) {
+            throw "$relative was not found on the deployment media."
+        }
+    }
+
+    $stageRoot = 'X:\Windows\Temp\AutoReset-KillDisk'
+    if (-not (Test-Path -LiteralPath 'X:\Windows\Temp')) {
+        $tempRoot = $env:TEMP
+        if ([string]::IsNullOrWhiteSpace($tempRoot)) {
+            $tempRoot = [System.IO.Path]::GetTempPath().TrimEnd('\', '/')
+        }
+        $stageRoot = Join-Path $tempRoot 'AutoReset-KillDisk'
+    }
+    New-Item -ItemType Directory -Path $stageRoot -Force -ErrorAction Stop | Out-Null
+
+    foreach ($relative in $required) {
+        $normalizedRelative = ($relative -replace '\\', '/')
+        $destination = Join-Path $stageRoot ([System.IO.Path]::GetFileName($normalizedRelative))
+        Copy-Item -LiteralPath $resolved[$relative] -Destination $destination -Force -ErrorAction Stop
+    }
+    return (Join-Path $stageRoot 'killdisk.ps1')
+}
+
 function Get-InitialTargetDisk {
     param([object[]]$Disks, [int[]]$ProtectedDiskNumbers, $ConfiguredNumber)
     $eligible = @($Disks | Where-Object {
@@ -913,6 +991,7 @@ $splashForm.Tag.Controls.Add($lblSplash)
 Set-FormSize -Form $splashForm
 #--------------------------------------------------------------------
 $splashForm.Show()
+$splashForm.CenterToScreen()
 $splashForm.Activate()
 Update-Ui
 
@@ -1267,31 +1346,13 @@ if (Get-Config 'ConfirmBeforeWipe' $true) {
         if ($confirmResult -eq [System.Windows.Forms.DialogResult]::Abort) {
             try {
                 Write-Log 'User triggered KillDisk launch (Ctrl+Shift+W).'
-
-                $wipeScript = $null
-                foreach ($root in @($script:MediaRoot, $script:ImagePayloadRoot)) {
-                    if (-not $root) { continue }
-                    $candidate = Join-Path $root 'Scripts\killdisk.ps1'
-                    Write-Log "Checking for wipe script: $candidate"
-                    if (Test-Path $candidate) { $wipeScript = $candidate; break }
-                }
-
                 Write-Log "MediaRoot: $($script:MediaRoot)"
                 Write-Log "ImagePayloadRoot: $($script:ImagePayloadRoot)"
-                Write-Log "Resolved wipe script: $wipeScript"
-
-                if ($wipeScript) {
-                    Invoke-KillDiskProcess -ScriptPath $wipeScript -Serial $script:Serial
-                    exit 0
-                }
-                else {
-                    Write-Log 'killdisk.ps1 not found on media.' 'ERROR'
-                    [void][System.Windows.Forms.MessageBox]::Show(
-                        'killdisk.ps1 was not found on the deployment media.',
-                        (Title 'Error'),
-                        [System.Windows.Forms.MessageBoxButtons]::OK,
-                        [System.Windows.Forms.MessageBoxIcon]::Error)
-                }
+                $stagedWipeScript = Stage-KillDiskRuntime -SourceRoots @($script:MediaRoot, $script:ImagePayloadRoot)
+                Write-Log "Staged wipe script: $stagedWipeScript"
+                Write-Log 'KillDisk scripts are now running from local WinPE storage; deployment media can be removed.'
+                Invoke-KillDiskProcess -ScriptPath $stagedWipeScript -Serial $script:Serial
+                exit 0
             }
             catch {
                 Write-Log "KillDisk launch FAILED: $($_.Exception.Message)" 'ERROR'
@@ -1696,6 +1757,7 @@ $script:DeployStart   = Get-Date
 Set-FormSize -Form $form
 #--------------------------------------------------------------------
 $form.Show()
+$form.CenterToScreen()
 $form.Activate()
 Update-Ui
 

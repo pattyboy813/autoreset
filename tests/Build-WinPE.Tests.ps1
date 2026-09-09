@@ -69,6 +69,15 @@ Describe 'Builder disk and volume safeguards' {
         } -ParameterFilter { $DriveLetter -eq 'Q' }
         { Get-ValidatedUsbVolumes } | Should -Throw '*writable*'
     }
+    It 'accepts partitions when boot/system flags are unavailable but not true' {
+        Mock Get-Partition {
+            [pscustomobject]@{ DiskNumber = [uint32]7; PartitionNumber = [uint32]1; IsReadOnly = $false; IsBoot = $null; IsSystem = $null }
+        } -ParameterFilter { $DriveLetter -eq 'P' }
+        Mock Get-Partition {
+            [pscustomobject]@{ DiskNumber = [uint32]7; PartitionNumber = [uint32]2; IsReadOnly = $false; IsBoot = $null; IsSystem = $null }
+        } -ParameterFilter { $DriveLetter -eq 'Q' }
+        (Get-ValidatedUsbVolumes).Disk.Number | Should -Be 7
+    }
     It 'rejects a <Property> disk' -TestCases @(
         @{ Property = 'IsBoot' }, @{ Property = 'IsSystem' }, @{ Property = 'IsReadOnly' }, @{ Property = 'IsOffline' }) {
         param($Property)
@@ -265,6 +274,13 @@ Describe 'Canonical sources and safe payload defaults' {
         Set-Content -LiteralPath (Join-Path $script:PayloadSource 'reset.json') -Value '{broken'
         { Assert-BuildPayload -PayloadSource $script:PayloadSource -BootOnly } | Should -Throw
     }
+    It 'keeps payload-source reparse checks non-recursive during startup preflight' {
+        Mock Assert-NoReparsePath { }
+        Assert-BuildPayload -PayloadSource $script:PayloadSource -BootOnly
+        Should -Invoke Assert-NoReparsePath -Times 1 -ParameterFilter {
+            $Path -eq $script:PayloadSource -and -not $Recurse
+        }
+    }
     It 'mirrors exactly the runtime files and removes obsolete overrides' {
         Mock Invoke-Robocopy { }
         $dest = Join-Path $TestDrive 'destination'
@@ -396,6 +412,15 @@ Describe 'Content-based cache and archive refresh' {
         $zip = [IO.Compression.ZipFile]::OpenRead($archive)
         try { $zip.Entries.Count | Should -Be 1 }
         finally { $zip.Dispose() }
+    }
+    It 'reuses driver source hash receipts for unchanged files' {
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir
+        Test-Path -LiteralPath "$archive.source.json" | Should -BeTrue
+        Mock Get-FileHash { throw 'Source hash should be reused from receipt.' } -ParameterFilter {
+            $LiteralPath -eq $script:DriverFile
+        }
+        { Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir } | Should -Not -Throw
+        Should -Invoke Get-FileHash -Times 0 -ParameterFilter { $LiteralPath -eq $script:DriverFile }
     }
     It 'rejects non-Windows and non-AMD64 extractors before executing them' {
         Mock Invoke-Tool { }

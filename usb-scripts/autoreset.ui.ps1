@@ -57,7 +57,7 @@ function New-ResetForm {
     finally { $graphics.Dispose() }
     $form | Add-Member -NotePropertyMembers @{
         _UiScale = $scale
-        _TargetWidth = [math]::Max(720, $Width)
+        _TargetWidth = [math]::Max(360, $Width)
         _MinimumHeight = $MinimumHeight
         _Sizing = $false
         _LayoutReady = $false
@@ -176,7 +176,7 @@ function Set-FormSize {
             $content.Height = $height
         }
         finally { $content.ResumeLayout($true) }
-        $minimumWidth = [int][math]::Min($maxWidth, 640 * $scale)
+        $minimumWidth = [int][math]::Min($maxWidth, [math]::Max(360 * $scale, [math]::Min($width, 640 * $scale)))
         $minimumHeight = [int][math]::Min($maxHeight, $Form._MinimumHeight * $scale)
         $Form.MinimumSize = New-Object System.Drawing.Size(
             ($minimumWidth + $frame.Width), ($minimumHeight + $frame.Height))
