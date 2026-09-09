@@ -491,13 +491,26 @@ function Test-PathWithin {
         $full.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Test-UnsupportedReparsePoint {
+    param([Parameter(Mandatory)]$Item)
+    if (-not ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+    $linkType = $null
+    if ($Item.PSObject.Properties.Name -contains 'LinkType') { $linkType = [string]$Item.LinkType }
+    if ($linkType) { return $true }
+    $target = $null
+    if ($Item.PSObject.Properties.Name -contains 'Target') { $target = $Item.Target }
+    if ($null -eq $target) { return $false }
+    if ($target -is [System.Array]) { return $target.Count -gt 0 }
+    return -not [string]::IsNullOrWhiteSpace([string]$target)
+}
+
 function Assert-NoReparsePath {
     param([Parameter(Mandatory)][string]$Path, [switch]$Recurse)
     $current = [IO.Path]::GetFullPath($Path)
     while ($current) {
         if (Test-Path -LiteralPath $current) {
             $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
-            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            if (Test-UnsupportedReparsePoint -Item $item) {
                 throw "Reparse points are not supported in build paths: $current"
             }
         }
@@ -507,7 +520,7 @@ function Assert-NoReparsePath {
     }
     if ($Recurse -and (Test-Path -LiteralPath $Path -PathType Container)) {
         foreach ($child in Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop) {
-            if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            if (Test-UnsupportedReparsePoint -Item $child) {
                 throw "Reparse points are not supported in build paths: $($child.FullName)"
             }
             if ($child.PSIsContainer) { Assert-NoReparsePath -Path $child.FullName -Recurse }
@@ -555,6 +568,7 @@ function Assert-BuildDiskSafe {
 
 function Get-BuildProtectedDiskNumbers {
     param([Parameter(Mandatory)][string[]]$Paths)
+    $supportsFilePath = (Get-Command -Name Get-Partition -ErrorAction Stop).Parameters.ContainsKey('FilePath')
     $numbers = foreach ($path in $Paths) {
         if (-not $path) { continue }
         $existing = [IO.Path]::GetFullPath($path)
@@ -564,7 +578,14 @@ function Get-BuildProtectedDiskNumbers {
             if (-not $parent -or $parent -eq $existing) { throw "Cannot identify source/output disk: $path" }
             $existing = $parent
         }
-        $partitions = @(Get-Partition -FilePath $existing -ErrorAction Stop)
+        if ($supportsFilePath) {
+            $partitions = @(Get-Partition -FilePath $existing -ErrorAction Stop)
+        }
+        else {
+            $qualifier = Split-Path -Path $existing -Qualifier
+            if ($qualifier -notmatch '^[A-Za-z]:$') { throw "Cannot identify source/output disk: $path" }
+            $partitions = @(Get-Partition -DriveLetter $qualifier.TrimEnd(':') -ErrorAction Stop)
+        }
         $diskNumbers = @($partitions.DiskNumber | Sort-Object -Unique)
         if ($diskNumbers.Count -ne 1) { throw "Cannot unambiguously identify source/output disk: $path" }
         [int]$diskNumbers[0]
@@ -778,11 +799,18 @@ function Assert-UsbPayloadOwnership {
 }
 
 function Copy-ChangedFile {
-    param([string]$Source, [string]$Destination)
+    param([string]$Source, [string]$Destination, [switch]$IgnoreAccessDenied)
     if (-not (Test-Path -LiteralPath $Destination -PathType Leaf) -or
         (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash -ne
         (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash) {
-        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        try {
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+        }
+        catch {
+            $isAccessDenied = $_.Exception -is [UnauthorizedAccessException] -or $_.Exception.Message -match '(?i)access.*denied'
+            if (-not $IgnoreAccessDenied -or -not $isAccessDenied) { throw }
+            Write-BuildLog "Skipping protected file update (access denied): $Destination"
+        }
     }
 }
 
@@ -849,7 +877,7 @@ function Sync-RuntimePayload {
             if (-not (Test-Path -LiteralPath $System32Path -PathType Container)) {
                 throw "WinPE System32 directory missing: $System32Path"
             }
-            Copy-ChangedFile -Source $BootsectSource -Destination (Join-Path $System32Path 'bootsect.exe')
+            Copy-ChangedFile -Source $BootsectSource -Destination (Join-Path $System32Path 'bootsect.exe') -IgnoreAccessDenied
         }
     }
 }

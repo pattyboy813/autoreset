@@ -152,6 +152,14 @@ Describe 'Builder disk and volume safeguards' {
         Mock Get-Partition { [pscustomobject]@{ DiskNumber = [uint32]4 }; [pscustomobject]@{ DiskNumber = [uint32]5 } } -ParameterFilter { $null -ne $FilePath }
         { Get-BuildProtectedDiskNumbers -Paths @($TestDrive) } | Should -Throw '*unambiguously*'
     }
+    It 'falls back to drive-letter mapping when Get-Partition lacks FilePath support' {
+        Mock Get-Command { [pscustomobject]@{ Parameters = @{ DriveLetter = $true } } } -ParameterFilter { $Name -eq 'Get-Partition' }
+        Mock Test-Path { $true }
+        Mock Split-Path { 'C:' } -ParameterFilter { $Qualifier }
+        Mock Get-Partition { [pscustomobject]@{ DiskNumber = [uint32]4 } } -ParameterFilter { $DriveLetter -eq 'C' }
+        @(Get-BuildProtectedDiskNumbers -Paths @($TestDrive)) | Should -Be @(4)
+        Should -Invoke Get-Partition -Times 1 -ParameterFilter { $DriveLetter -eq 'C' }
+    }
 }
 
 Describe 'USB validation reports failure in its own scope' {
@@ -353,6 +361,16 @@ Describe 'Content-based cache and archive refresh' {
         [IO.File]::WriteAllText($dest, 'BBBB')
         Copy-ChangedFile -Source $script:DriverFile -Destination $dest
         [IO.File]::ReadAllText($dest) | Should -Be 'AAAA'
+    }
+    It 'can ignore access-denied copy failures when explicitly requested' {
+        $dest = Join-Path $TestDrive 'protected.inf'
+        [IO.File]::WriteAllText($dest, 'BBBB')
+        Mock Copy-Item { throw ([UnauthorizedAccessException]::new('Access denied')) } -ParameterFilter {
+            $LiteralPath -eq $script:DriverFile -and $Destination -eq $dest
+        }
+        { Copy-ChangedFile -Source $script:DriverFile -Destination $dest -IgnoreAccessDenied } | Should -Not -Throw
+        { Copy-ChangedFile -Source $script:DriverFile -Destination $dest } | Should -Throw '*Access denied*'
+        Should -Invoke Write-BuildLog -Times 1 -ParameterFilter { $Text -like '*Skipping protected file update*' }
     }
     It 'uses zip without a runtime extractor and excludes old archive formats' {
         [IO.File]::WriteAllText((Join-Path $script:DriverSource 'Drivers.7z'), 'old-source-archive')
@@ -751,6 +769,19 @@ Describe 'Isolated workspace and mount cleanup' {
         try { New-Item -ItemType SymbolicLink -Path (Join-Path $dest 'link') -Target $target -ErrorAction Stop | Out-Null }
         catch { Set-ItResult -Skipped -Because 'This host cannot create test symbolic links.'; return }
         { Assert-NoReparsePath -Path $dest -Recurse } | Should -Throw '*Reparse points*'
+    }
+    It 'allows non-link reparse points for cloud-filtered directories' {
+        $path = Join-Path $TestDrive 'cloud-filtered'
+        Mock Test-Path { $true } -ParameterFilter { $LiteralPath -eq $path }
+        Mock Get-Item {
+            [pscustomobject]@{
+                FullName   = $path
+                Attributes = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint
+                LinkType   = $null
+                Target     = $null
+            }
+        } -ParameterFilter { $LiteralPath -eq $path }
+        { Assert-NoReparsePath -Path $path } | Should -Not -Throw
     }
     It 'does not remove a workspace with a live mounted image' {
         $WorkDir = $script:OwnedWorkspace
