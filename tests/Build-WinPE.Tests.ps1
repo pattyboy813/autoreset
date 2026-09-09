@@ -830,6 +830,14 @@ Describe 'Isolated workspace and mount cleanup' {
 }
 
 Describe 'Optional WinPE display mode' {
+    It 'keeps PowerShell visible until AutoReset initializes or reports a startup failure' {
+        Set-WinPEStartup -System32Path $TestDrive
+        foreach ($launcher in @('winpeshl.ini', 'startnet.cmd')) {
+            $content = Get-Content -LiteralPath (Join-Path $TestDrive $launcher) -Raw
+            $content | Should -Match '-NoExit'
+            $content | Should -Not -Match '-WindowStyle Hidden'
+        }
+    }
     It 'does not generate Display or unattended arguments by default' {
         Set-WinPEStartup -System32Path $TestDrive
         Test-Path -LiteralPath (Join-Path $TestDrive 'winpe-unattend.xml') | Should -BeFalse

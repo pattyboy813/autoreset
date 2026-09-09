@@ -1162,10 +1162,10 @@ function Set-WinPEStartup {
     if ($wpeinitArgs) { $shellInit += ',' + $wpeinitArgs }
     Set-Content -LiteralPath (Join-Path $System32Path 'winpeshl.ini') -Encoding Ascii -Value @(
         '[LaunchApps]', $shellInit,
-        '%SYSTEMDRIVE%\Windows\System32\WindowsPowerShell\v1.0\powershell.exe, -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File X:\Payload\Scripts\autoreset.ps1')
+        '%SYSTEMDRIVE%\Windows\System32\WindowsPowerShell\v1.0\powershell.exe, -NoProfile -NoExit -ExecutionPolicy Bypass -File X:\Payload\Scripts\autoreset.ps1')
     Set-Content -LiteralPath (Join-Path $System32Path 'startnet.cmd') -Encoding Ascii -Value @(
         '@echo off', "wpeinit$wpeinitArgs",
-        'X:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File X:\Payload\Scripts\autoreset.ps1')
+        'X:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NoExit -ExecutionPolicy Bypass -File X:\Payload\Scripts\autoreset.ps1')
 }
 
 function Assert-RuntimeExtractor {
