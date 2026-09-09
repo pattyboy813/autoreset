@@ -851,6 +851,14 @@ Describe 'Optional WinPE display mode' {
 }
 
 Describe 'Build orchestration regression guards' {
+    It 'uses fast refresh by default but permits strict verification' {
+        $parameter = $script:BuilderAst.ParamBlock.Parameters | Where-Object {
+            $_.Name.VariablePath.UserPath -eq 'FastRefresh'
+        }
+        $parameter.DefaultValue.Extent.Text | Should -Be '$true'
+        $source = $script:BuilderAst.Extent.Text
+        $source | Should -Match 'Get-CachedFileHash -Path \$srcWinpeWim.*-TrustMetadata:\$FastRefresh'
+    }
     It 'injects boot drivers for ISO and USB, not just USB' {
         $calls = $script:BuilderAst.FindAll({
             param($node)
