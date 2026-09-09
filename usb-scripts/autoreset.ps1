@@ -909,10 +909,18 @@ $lblSplash.ForeColor    = [System.Drawing.Color]::FromArgb(80, 80, 80)
 $lblSplash.BackColor    = [System.Drawing.Color]::Transparent
 $splashForm.Tag.Controls.Add($lblSplash)
 
+$pbSplash                       = New-Object System.Windows.Forms.ProgressBar
+$pbSplash.Style                 = 'Marquee'
+$pbSplash.MarqueeAnimationSpeed = 30
+$pbSplash.Size                  = New-Object System.Drawing.Size(444, 20)
+$pbSplash.Margin                = New-Object System.Windows.Forms.Padding(0, 10, 0, 0)
+$splashForm.Tag.Controls.Add($pbSplash)
+
 # Pat - Set-FormSize before Show ------------------------------------
 Set-FormSize -Form $splashForm
 #--------------------------------------------------------------------
 $splashForm.Show()
+$splashForm.CenterToScreen()
 $splashForm.Activate()
 Update-Ui
 
@@ -1435,6 +1443,10 @@ function Set-Action {
     param([string]$Text, [switch]$Quiet)
     $lblStep.Text    = $Text
     $lblStep.Visible = $true
+    $pbStep.Value                 = 0
+    $pbStep.Visible               = $true
+    $pbStep.Style                 = 'Marquee'
+    $pbStep.MarqueeAnimationSpeed = 30
     if (-not $Quiet) { Write-Log $Text }
     Set-FormSize -Form $form
     Update-Ui
@@ -1696,6 +1708,7 @@ $script:DeployStart   = Get-Date
 Set-FormSize -Form $form
 #--------------------------------------------------------------------
 $form.Show()
+$form.CenterToScreen()
 $form.Activate()
 Update-Ui
 
