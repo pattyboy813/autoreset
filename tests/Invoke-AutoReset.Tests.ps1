@@ -124,7 +124,8 @@ Describe 'Deployment structure and shared UI integration' {
     It 'defines console recovery before startup initialization and hides it only afterwards' {
         $showConsole = $script:DeploymentSource.IndexOf('function Show-Console')
         $startup = $script:DeploymentSource.IndexOf("Write-BootstrapLog 'Loading WinForms assemblies.'")
-        $hideConsole = $script:DeploymentSource.IndexOf('Hide-Console')
+        $hideConsole = $script:DeploymentSource.IndexOf("`r`nHide-Console`r`n")
+        if ($hideConsole -lt 0) { $hideConsole = $script:DeploymentSource.IndexOf("`nHide-Console`n") }
         $showConsole | Should -BeLessThan $startup
         $hideConsole | Should -BeGreaterThan $startup
         $script:DeploymentSource | Should -Match '(?s)catch \{\s*Write-BootstrapLog "Startup initialization failed:.*?Show-Console'
