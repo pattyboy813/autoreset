@@ -2087,7 +2087,7 @@ $bootWimFile = [pscustomobject]@{
     RelativePath = 'sources/boot.wim'; Length = (Get-Item -LiteralPath $bootWimSource).Length; SourcePath = $bootWimSource
 }
 $bootFiles = @(Get-MediaFileInventory -Root $mediaDir -ExcludePayload |
-    Where-Object { $_.RelativePath -ne 'sources/boot.wim' }) + @($bootWimFile)
+    Where-Object { (ConvertTo-BuildRelativePath $_.RelativePath) -ne 'sources/boot.wim' }) + @($bootWimFile)
 $payloadFiles = @(Get-MediaFileInventory -Root $mediaPayload) + $externalPayloadFiles
 Start-BuildPhase 'output'
 

@@ -687,6 +687,64 @@ Describe 'Two-level WIM servicing integration with mocked DISM' {
         Should -Invoke Invoke-Tool -Times 0
         Should -Invoke Get-FileHash -Times 0
     }
+    It 'syncs exactly one boot WIM for <State> builds with <Separator> inventory paths' -ForEach @(
+        @{ State = 'cold'; Separator = '\' }
+        @{ State = 'cold'; Separator = '/' }
+        @{ State = 'base-hit'; Separator = '\' }
+        @{ State = 'base-hit'; Separator = '/' }
+        @{ State = 'final-hit'; Separator = '\' }
+        @{ State = 'final-hit'; Separator = '/' }
+        @{ State = 'no-cache'; Separator = '\' }
+        @{ State = 'no-cache'; Separator = '/' }
+    ) {
+        if ($State -in @('base-hit', 'final-hit')) {
+            $null = Invoke-WinPEImageBuild @script:BuildArgs
+            Remove-Item -LiteralPath $script:WorkingWim
+            if ($State -eq 'base-hit') {
+                Remove-Item -LiteralPath $script:Plan.FinalPath
+            }
+        }
+        $bootWimSource = Invoke-WinPEImageBuild @script:BuildArgs -NoCache:($State -eq 'no-cache')
+        $bootWimSource | Should -Be $(if ($State -eq 'final-hit') { $script:Plan.FinalPath } else { $script:WorkingWim })
+        $bootWimFile = [pscustomobject]@{
+            RelativePath = 'sources/boot.wim'
+            Length = (Get-Item -LiteralPath $bootWimSource).Length
+            SourcePath = $bootWimSource
+        }
+        $script:BootInventory = @([pscustomobject]@{
+            RelativePath = "Boot${Separator}boot.sdi"
+            Length = (Get-Item -LiteralPath $script:SourceWim).Length
+            SourcePath = $script:SourceWim
+        })
+        if (Test-Path -LiteralPath $script:WorkingWim) {
+            $script:BootInventory += [pscustomobject]@{
+                RelativePath = "sources${Separator}boot.wim"
+                Length = (Get-Item -LiteralPath $script:WorkingWim).Length
+                SourcePath = $script:WorkingWim
+            }
+        }
+        Mock Get-MediaFileInventory { $script:BootInventory }
+        Mock Update-StepDisplay { }
+        Mock Clear-Disk { throw 'Inventory tests must never touch a disk.' }
+        $mediaDir = $script:OwnedWorkspace
+        $assignment = $script:BuilderAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq '$bootFiles'
+        }, $true)
+        $assignment.Count | Should -Be 1
+        # Evaluate only the inventory expression, never the builder entrypoint.
+        $bootFiles = @(& ([scriptblock]::Create($assignment[0].Right.Extent.Text)))
+        $bootFiles.Count | Should -Be 2
+        $wims = @($bootFiles | Where-Object { (ConvertTo-BuildRelativePath $_.RelativePath) -eq 'sources/boot.wim' })
+        $wims.Count | Should -Be 1
+        $wims[0].SourcePath | Should -Be $bootWimSource
+        $destination = Join-Path $TestDrive 'boot-output'
+        Sync-BuildFiles -Files $bootFiles -Destination $destination
+        [IO.File]::ReadAllText((Join-Path $destination 'sources/boot.wim')) |
+            Should -Be ([IO.File]::ReadAllText($bootWimSource))
+        Should -Invoke Clear-Disk -Times 0
+    }
     It 'customizes a runtime-only change from the base without reinstalling packages or drivers' {
         Invoke-WinPEImageBuild @script:BuildArgs
         $baseHash = (Get-FileHash -LiteralPath $script:Plan.BasePath).Hash
@@ -939,7 +997,7 @@ Describe 'Build orchestration regression guards' {
         $source = $script:BuilderAst.Extent.Text
         $source | Should -Match '\$bootWimSource = Invoke-WinPEImageBuild'
         $source | Should -Match 'RelativePath = ''sources/boot.wim''; Length = \(Get-Item -LiteralPath \$bootWimSource\).Length; SourcePath = \$bootWimSource'
-        $source | Should -Match '(?s)\$bootFiles = @\(Get-MediaFileInventory.*?Where-Object \{ \$_.RelativePath -ne ''sources/boot.wim'' \}\) \+ @\(\$bootWimFile\)'
+        $source | Should -Match '(?s)\$bootFiles = @\(Get-MediaFileInventory.*?Where-Object \{ \(ConvertTo-BuildRelativePath \$_.RelativePath\) -ne ''sources/boot.wim'' \}\) \+ @\(\$bootWimFile\)'
         $source | Should -Match '(?s)if \(\$PSCmdlet.ParameterSetName -eq ''ISO''\) \{\s+if \(\$bootWimSource -ne \$bootWim\) \{\s+Sync-BuildFiles -Files @\(\$bootWimFile\) -Destination \$mediaDir'
     }
     It 'injects boot drivers for ISO and USB, not just USB' {
