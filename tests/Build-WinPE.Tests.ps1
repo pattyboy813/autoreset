@@ -12,6 +12,23 @@
     }, $true)
     . ([scriptblock]::Create(($functions.Extent.Text -join "`n")))
 
+    $script:RefreshPolicy = @($script:BuilderAst.EndBlock.Statements | Where-Object {
+        $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $_.Left.Extent.Text -eq '$FastRefresh'
+    })
+    # Bind only the real parameter block and isolated policy assignment, never the entrypoint.
+    $script:BindBuilderParameters = [scriptblock]::Create(
+        $script:BuilderAst.ParamBlock.Extent.Text + "`n" +
+        ($script:RefreshPolicy.Extent.Text -join "`n") + @'
+
+[pscustomobject]@{
+    Mode = $PSCmdlet.ParameterSetName
+    Strict = [bool]$StrictVerify
+    Fast = $FastRefresh
+    Bound = $PSBoundParameters
+}
+'@)
+
     # Storage/DISM commands are absent on Linux; never call actual disk operations.
     function Get-Disk { [CmdletBinding()] param($Number) throw 'Unmocked Get-Disk' }
     function Get-Volume { [CmdletBinding()] param($FileSystemLabel) throw 'Unmocked Get-Volume' }
@@ -352,7 +369,6 @@ Describe 'Content-based cache and archive refresh' {
         Mock Write-Aside { }
         Mock Write-BuildLog { }
         $script:RuntimeExtractor = $null
-        $DriverCompression = 'Fast'
         $WorkDir = Join-Path $TestDrive 'work'
         $script:DriverSource = Join-Path $TestDrive ('driver-source-' + [guid]::NewGuid().ToString('N'))
         $script:ArchiveDir = Join-Path $TestDrive ('archives-' + [guid]::NewGuid().ToString('N'))
@@ -533,23 +549,21 @@ Describe 'Content-based cache and archive refresh' {
             Should -Throw '*runtime cannot extract*'
         Test-Path -LiteralPath (Join-Path $script:ArchiveDir 'Drivers.7z') | Should -BeFalse
     }
-    It 'uses <Compression> 7z settings without imposing Maximum settings on fast builds' -ForEach @(
-        @{ Compression = 'Fast'; Level = '-mx=1' }
-        @{ Compression = 'Balanced'; Level = '-mx=5' }
-        @{ Compression = 'Maximum'; Level = '-mx=9' }
+    It 'always uses Maximum 7z settings with FastRefresh=<Fast>' -ForEach @(
+        @{ Fast = $true }
+        @{ Fast = $false }
     ) {
         $script:RuntimeExtractor = Join-Path $TestDrive '7za.exe'
         [IO.File]::WriteAllText($script:RuntimeExtractor, 'extractor')
         Mock Invoke-Tool {
             if ($ArgumentList[0] -eq 'a') { [IO.File]::WriteAllText($ArgumentList[-2], 'archive') }
         }
-        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression $Compression
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh:$Fast
         Should -Invoke Invoke-Tool -Times 1 -Exactly -ParameterFilter {
-            $ArgumentList[0] -eq 'a' -and $ArgumentList -contains '-m0=lzma2' -and $ArgumentList -contains $Level
+            $ArgumentList[0] -eq 'a' -and $FilePath -eq $script:RuntimeExtractor -and
+            ($ArgumentList[1..6] -join ' ') -eq '-t7z -m0=lzma2 -mx=9 -mfb=273 -md=128m -ms=on'
         }
-        if ($Compression -ne 'Maximum') {
-            Should -Invoke Invoke-Tool -Times 0 -ParameterFilter { $ArgumentList -contains '-md=128m' -or $ArgumentList -contains '-mfb=273' }
-        }
+        Should -Invoke Invoke-Tool -Times 1 -Exactly -ParameterFilter { $ArgumentList[0] -eq 't' }
     }
     It 'rebuilds and retests when extractor bytes change despite identical timestamps and lengths' {
         $script:RuntimeExtractor = Join-Path $TestDrive '7za.exe'
@@ -566,20 +580,32 @@ Describe 'Content-based cache and archive refresh' {
         Should -Invoke Invoke-Tool -Times 2 -Exactly -ParameterFilter { $ArgumentList[0] -eq 't' }
         Test-Path -LiteralPath "$archive.hash" | Should -BeTrue
     }
-    It 'rebuilds and retests when the compression profile or successful receipt changes' {
+    It 'handles previous <Profile> 7z receipts and retests damaged receipts' -ForEach @(
+        @{ Profile = 'Fast'; Options = '-m0=lzma2 -mx=1 -ms=on'; ZipLevel = 'Fastest'; Builds = 2 }
+        @{ Profile = 'Balanced'; Options = '-m0=lzma2 -mx=5 -ms=on'; ZipLevel = 'Optimal'; Builds = 2 }
+        @{ Profile = 'Maximum'; Options = '-m0=lzma2 -mx=9 -mfb=273 -md=128m -ms=on'; ZipLevel = 'Optimal'; Builds = 1 }
+    ) {
         $script:RuntimeExtractor = Join-Path $TestDrive '7za.exe'
         [IO.File]::WriteAllText($script:RuntimeExtractor, 'extractor')
         Mock Invoke-Tool {
             if ($ArgumentList[0] -eq 'a') { [IO.File]::WriteAllText($ArgumentList[-2], 'archive') }
         }
-        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression Fast
-        $firstReceipt = Get-Content -LiteralPath "$archive.hash" -Raw
-        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression Balanced
-        Get-Content -LiteralPath "$archive.hash" -Raw | Should -Not -Be $firstReceipt
+        $archive = Join-Path $script:ArchiveDir 'Drivers.7z'
+        [IO.File]::WriteAllText($archive, 'archive')
+        $oldKey = Get-BuildPartsHash -Parts @('driver-archive-v2',
+            (Get-DriverSourceHash -SourcePath $script:DriverSource), $Profile, $Options, $ZipLevel,
+            (Get-FileHash -LiteralPath $script:RuntimeExtractor).Hash)
+        $oldReceipt = "$oldKey|$((Get-FileHash -LiteralPath $archive).Hash)"
+        Set-Content -LiteralPath "$archive.hash" -Value $oldReceipt
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh
+        $receipt = (Get-Content -LiteralPath "$archive.hash" -Raw).Trim()
+        ($receipt -eq $oldReceipt) | Should -Be ($Profile -eq 'Maximum')
+        Should -Invoke Invoke-Tool -Times ($Builds - 1) -Exactly -ParameterFilter { $ArgumentList[0] -eq 'a' }
+        Should -Invoke Invoke-Tool -Times ($Builds - 1) -Exactly -ParameterFilter { $ArgumentList[0] -eq 't' }
         Set-Content -LiteralPath "$archive.hash" -Value 'malformed'
-        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression Balanced
-        Should -Invoke Invoke-Tool -Times 3 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'a' }
-        Should -Invoke Invoke-Tool -Times 3 -Exactly -ParameterFilter { $ArgumentList[0] -eq 't' }
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh
+        Should -Invoke Invoke-Tool -Times $Builds -Exactly -ParameterFilter { $ArgumentList[0] -eq 'a' }
+        Should -Invoke Invoke-Tool -Times $Builds -Exactly -ParameterFilter { $ArgumentList[0] -eq 't' }
     }
     It 'retains content corruption detection after a successful 7z test' {
         $script:RuntimeExtractor = Join-Path $TestDrive '7za.exe'
@@ -596,13 +622,39 @@ Describe 'Content-based cache and archive refresh' {
         Should -Invoke Invoke-Tool -Times 2 -Exactly -ParameterFilter { $ArgumentList[0] -eq 't' }
         [IO.File]::ReadAllText($archive) | Should -Be 'archive'
     }
-    It 'includes the ZIP profile in its cache identity' {
-        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression Fast
-        $firstReceipt = Get-Content -LiteralPath "$archive.hash" -Raw
-        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -Compression Balanced
-        Get-Content -LiteralPath "$archive.hash" -Raw | Should -Not -Be $firstReceipt
-        $source = (Get-Command Invoke-DriverArchive).Definition
-        $source | Should -Match "Compression -eq 'Fast'.*'Fastest'.*'Optimal'"
+    It 'handles previous <Profile> ZIP receipts with the permanent Maximum identity' -ForEach @(
+        @{ Profile = 'Fast'; Options = '-m0=lzma2 -mx=1 -ms=on'; ZipLevel = 'Fastest'; Builds = 1 }
+        @{ Profile = 'Balanced'; Options = '-m0=lzma2 -mx=5 -ms=on'; ZipLevel = 'Optimal'; Builds = 1 }
+        @{ Profile = 'Maximum'; Options = '-m0=lzma2 -mx=9 -mfb=273 -md=128m -ms=on'; ZipLevel = 'Optimal'; Builds = 0 }
+    ) {
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir
+        $maximumReceipt = (Get-Content -LiteralPath "$archive.hash" -Raw).Trim()
+        $oldKey = Get-BuildPartsHash -Parts @('driver-archive-v2',
+            (Get-DriverSourceHash -SourcePath $script:DriverSource), $Profile, $Options, $ZipLevel, 'dotnet-zip')
+        Set-Content -LiteralPath "$archive.hash" -Value "$oldKey|$((Get-FileHash -LiteralPath $archive).Hash)"
+        Mock Move-Item {
+            [IO.File]::Copy($LiteralPath, $Destination, $true)
+            [IO.File]::Delete($LiteralPath)
+        }
+        Mock Invoke-Tool { throw 'ZIP fallback must not execute any extractor.' }
+        $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh
+        (Get-Content -LiteralPath "$archive.hash" -Raw).Trim() | Should -Be $maximumReceipt
+        Should -Invoke Move-Item -Times $Builds -Exactly -ParameterFilter { $Destination -eq $archive }
+        Should -Invoke Invoke-Tool -Times 0
+    }
+    It 'uses ZIP Optimal when no validated runtime extractor is supplied' {
+        [IO.File]::WriteAllText($script:DriverFile, ('repeated driver content ' * 10000))
+        Mock Invoke-Tool { throw 'ZIP fallback must not execute any extractor.' }
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir
+        $referencePath = Join-Path $TestDrive 'optimal-reference.zip'
+        $reference = [IO.Compression.ZipFile]::Open($referencePath, [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            $null = [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $reference, $script:DriverFile, 'driver.inf', [IO.Compression.CompressionLevel]::Optimal)
+        }
+        finally { $reference.Dispose() }
+        (Get-FileHash -LiteralPath $archive).Hash | Should -Be (Get-FileHash -LiteralPath $referencePath).Hash
+        Should -Invoke Invoke-Tool -Times 0
     }
 }
 
@@ -973,14 +1025,100 @@ Describe 'Optional WinPE display mode' {
     }
 }
 
-Describe 'Build orchestration regression guards' {
-    It 'uses fast refresh by default but permits strict verification' {
-        $parameter = $script:BuilderAst.ParamBlock.Parameters | Where-Object {
-            $_.Name.VariablePath.UserPath -eq 'FastRefresh'
+Describe 'Public build parameter binding without entrypoint execution' {
+    It 'preserves the complete supported parameter surface and BootOnly alias' {
+        $names = @($script:BuilderAst.ParamBlock.Parameters.Name.VariablePath.UserPath | Sort-Object)
+        $names | Should -Be (@(
+            'UsbDiskNumber', 'OutputRoot', 'WorkDir', 'KeepWorkDir', 'WinPEResolution',
+            'SkipPayload', 'InstallPrerequisites', 'AllowNonUsbDisk', 'UpdateUsb', 'NoCache',
+            'StrictVerify', 'BuildIso', 'IsoPath', 'PrepareImage', 'SourceImage', 'Edition',
+            'SourceIndex', 'DestinationImage', 'Rebuild', 'ListOnly', 'PrepareDrivers',
+            'Device', 'Force', 'ValidateUsb', 'LogFile'
+        ) | Sort-Object)
+        $bound = & $script:BindBuilderParameters -UsbDiskNumber 7 -BootOnly -NoCache -KeepWorkDir -AllowNonUsbDisk
+        $bound.Bound.UsbDiskNumber | Should -Be 7
+        foreach ($name in @('SkipPayload', 'NoCache', 'KeepWorkDir', 'AllowNonUsbDisk')) {
+            [bool]$bound.Bound[$name] | Should -BeTrue
         }
-        $parameter.DefaultValue.Extent.Text | Should -Be '$true'
+    }
+    It 'rejects removed public parameter <Name>' -ForEach @(
+        @{ Name = 'DriverCompression'; Value = 'Maximum' }
+        @{ Name = 'NoZip'; Value = $true }
+        @{ Name = 'FastRefresh'; Value = $false }
+    ) {
+        $arguments = @{ PrepareDrivers = $true }
+        $arguments[$Name] = $Value
+        { & $script:BindBuilderParameters @arguments } | Should -Throw '*parameter cannot be found*'
+    }
+    It 'binds <Mode> with fast defaults and opt-in strict verification' -ForEach @(
+        @{ Mode = 'USB'; ModeArgs = @{ UsbDiskNumber = 7 } }
+        @{ Mode = 'USBUPDATE'; ModeArgs = @{ UpdateUsb = $true } }
+        @{ Mode = 'ISO'; ModeArgs = @{ BuildIso = $true; IsoPath = 'output.iso' } }
+        @{ Mode = 'PrepareImage'; ModeArgs = @{ PrepareImage = $true; SourceImage = 'install.esd' } }
+        @{ Mode = 'PrepareDrivers'; ModeArgs = @{ PrepareDrivers = $true; Device = 'Model'; Force = $true } }
+        @{ Mode = 'ValidateUsb'; ModeArgs = @{ ValidateUsb = $true; LogFile = 'validation.log' } }
+    ) {
+        $default = & $script:BindBuilderParameters @ModeArgs
+        $explicitFalse = & $script:BindBuilderParameters @ModeArgs -StrictVerify:$false
+        $strictSwitch = & $script:BindBuilderParameters @ModeArgs -StrictVerify
+        $explicitTrue = & $script:BindBuilderParameters @ModeArgs -StrictVerify:$true
+        foreach ($result in @($default, $explicitFalse)) {
+            $result.Mode | Should -Be $Mode
+            $result.Fast | Should -BeTrue
+            $result.Strict | Should -BeFalse
+        }
+        foreach ($result in @($strictSwitch, $explicitTrue)) {
+            $result.Mode | Should -Be $Mode
+            $result.Fast | Should -BeFalse
+            $result.Strict | Should -BeTrue
+        }
+    }
+    It 'still rejects conflicting output modes and invalid image indexes' {
+        { & $script:BindBuilderParameters -BuildIso -UpdateUsb } | Should -Throw
+        { & $script:BindBuilderParameters -PrepareImage -SourceImage 'install.esd' -SourceIndex 0 } | Should -Throw
+    }
+}
+
+Describe 'Build orchestration regression guards' {
+    It 'defines opt-in StrictVerify and initializes its inverse before any prep dispatch' {
+        $parameter = $script:BuilderAst.ParamBlock.Parameters | Where-Object {
+            $_.Name.VariablePath.UserPath -eq 'StrictVerify'
+        }
+        $parameter.StaticType | Should -Be ([switch])
+        $parameter.DefaultValue | Should -BeNullOrEmpty
+        $script:RefreshPolicy.Count | Should -Be 1
+        $script:RefreshPolicy[0].Right.Extent.Text | Should -Be '-not $StrictVerify'
+        $dispatches = $script:BuilderAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -in @('Invoke-ImagePreparation', 'Invoke-DriverPreparation', 'Invoke-UsbValidation')
+        }, $true)
+        $dispatches.Count | Should -Be 3
+        foreach ($dispatch in $dispatches) {
+            $script:RefreshPolicy[0].Extent.EndOffset | Should -BeLessThan $dispatch.Extent.StartOffset
+        }
         $source = $script:BuilderAst.Extent.Text
         $source | Should -Match 'Get-CachedFileHash -Path \$srcWinpeWim.*-TrustMetadata:\$FastRefresh'
+    }
+    It 'propagates the policy through hashing, artifact verification and every media sync' {
+        $calls = $script:BuilderAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -in @('Get-CachedFileHash', 'Get-ContentTreeHash', 'Test-WinPECacheImage', 'Sync-BuildFiles')
+        }, $true)
+        foreach ($call in $calls) {
+            if ($call.GetCommandName() -in @('Test-WinPECacheImage', 'Sync-BuildFiles')) {
+                $call.Extent.Text | Should -Match '-FastRefresh:\$FastRefresh'
+            }
+            elseif ($call.Extent.Text -notmatch '-TrustMetadata') {
+                # Only fresh archive/WIM publication hashes intentionally ignore metadata.
+                $call.Extent.Text | Should -Match '-Path \$(archivePath|Path) -ReceiptDirectory'
+            }
+            else {
+                $call.Extent.Text | Should -Match '-TrustMetadata:\$(FastRefresh|TrustMetadata)'
+            }
+        }
+        (Get-Command Invoke-DriverArchive).Definition | Should -Match '-UseMetadataReceipt:\$FastRefresh'
     }
     It 'explicitly propagates the refresh policy to every WIM and driver archive build' {
         $calls = $script:BuilderAst.FindAll({
@@ -1066,10 +1204,10 @@ Describe 'Build orchestration regression guards' {
             $sync.Extent.Text | Should -Not -Match '-Mirror'
         }
     }
-    It 'defaults driver compression to Fast and validates supported profiles' {
-        $parameter = $script:BuilderAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'DriverCompression' }
-        $parameter.DefaultValue.SafeGetValue() | Should -Be 'Fast'
-        $parameter.Extent.Text | Should -Match "ValidateSet\('Fast', 'Balanced', 'Maximum'\)"
+    It 'has no selectable archive compression or raw-driver early return' {
+        (Get-Command Invoke-DriverArchive).Parameters.Keys | Should -Not -Contain 'Compression'
+        $script:BuilderAst.Extent.Text | Should -Not -Match '\$DriverCompression|\$NoZip|\$Compression\b'
+        (Get-Command Invoke-DriverPreparation).Definition | Should -Not -Match 'Using raw drivers'
     }
     It 'stops output timing after every output branch without detaching an else clause' {
         $commands = $script:BuilderAst.FindAll({

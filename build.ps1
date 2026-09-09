@@ -26,8 +26,10 @@
     custom answer files, integrate equivalent WinRE initialization/verification
     yourself and set SetupRecovery=false to preserve your answer files.
 
-    Driver archives use ZIP unless tools\7za.exe is a compatible,
-    standalone AMD64 extractor. A supplied incompatible extractor is an error.
+    Driver archives always use maximum 7-Zip compression when tools\7za.exe is a
+    compatible, standalone AMD64 extractor; otherwise, when absent, ZIP Optimal
+    is used. A supplied incompatible extractor is an error. Maximum compression
+    is slower for new or changed archives; unchanged cached archives are reused.
     The trusted ADK AMD64 bootsect.exe is bundled in WinPE Windows\System32
     (on PATH) and tools for legacy BIOS deployment.
     Content-verified caches separate the serviced WinPE base from runtime
@@ -38,7 +40,7 @@
     from their original locations, not through the workspace. ISO builds still
     materialize these files. Cached WIMs are never mounted or modified.
     Repeated builds trust unchanged size+timestamp metadata by default so large
-    WIMs are not reread. Use -FastRefresh:$false for full SHA256 verification.
+    WIMs are not reread. Use -StrictVerify for full SHA256 verification.
     WorkDir is a parent for a unique, builder-owned workspace; existing folders
     and unrelated DISM mounts are never cleaned up. Failed workspaces are retained.
     USB updates require exactly one PE (FAT32) and PAYLOAD (NTFS) volume on the
@@ -82,16 +84,12 @@
 .PARAMETER NoCache
     Bypass both serviced-base and customized-final WIM caches (reads and writes).
 
-.PARAMETER FastRefresh
-    Enabled by default. Unchanged size+timestamp files skip repeated SHA256 work
-    during cache planning, WIM/driver archive verification and USB/ISO sync.
-    Missing or changed metadata receipts require hashing. Use -FastRefresh:$false
-    when full byte-level verification, including driver sources, is required.
-
-.PARAMETER DriverCompression
-    Fast (default) favors build time: LZMA2 level 1 or ZIP Fastest.
-    Balanced uses LZMA2 level 5; Maximum uses level 9 with a larger dictionary.
-    ZIP uses Optimal for Balanced and Maximum. Changing profiles rebuilds archives.
+.PARAMETER StrictVerify
+    Opt in to full SHA256 verification during cache planning, WIM/driver archive
+    verification (including driver sources) and USB/ISO sync. By default, or with
+    -StrictVerify:$false, unchanged size+timestamp files skip repeated hashing.
+    Missing or changed metadata receipts still require hashing. Strict verification
+    can take much longer; it does not disable cache reuse or change compression.
 
 .EXAMPLE
     .\build.ps1 -UpdateUsb
@@ -140,10 +138,7 @@ param(
 
     [switch]$NoCache,
 
-    [switch]$FastRefresh = $true,
-
-    [ValidateSet('Fast', 'Balanced', 'Maximum')]
-    [string]$DriverCompression = 'Fast',
+    [switch]$StrictVerify,
 
     [Parameter(ParameterSetName = 'ISO', Mandatory)]
     [switch]$BuildIso,
@@ -180,9 +175,6 @@ param(
     [string]$Device,
 
     [Parameter(ParameterSetName = 'PrepareDrivers')]
-    [switch]$NoZip,
-
-    [Parameter(ParameterSetName = 'PrepareDrivers')]
     [switch]$Force,
 
     [Parameter(ParameterSetName = 'ValidateUsb', Mandatory)]
@@ -193,6 +185,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$FastRefresh = -not $StrictVerify
 $script:BuildStopwatch = [Diagnostics.Stopwatch]::StartNew()
 $script:BuildPhases = @{}
 
@@ -1368,9 +1361,7 @@ function Invoke-DriverArchive {
         [Parameter(Mandatory)][string]$ArchiveDir,
         [string]$Label,
         [switch]$ForceRebuild,
-        [switch]$FastRefresh,
-        [ValidateSet('Fast', 'Balanced', 'Maximum')]
-        [string]$Compression = $(if ($DriverCompression) { $DriverCompression } else { 'Fast' })
+        [switch]$FastRefresh
     )
     if (-not (Test-Path -LiteralPath $SourcePath -PathType Container)) { return $null }
     Assert-NoReparsePath -Path $SourcePath -Recurse
@@ -1393,19 +1384,16 @@ function Invoke-DriverArchive {
         if (Test-Path -LiteralPath $stalePath) { Remove-Item -LiteralPath $stalePath -Force -ErrorAction Stop }
     }
 
-    $options = switch ($Compression) {
-        'Fast' { @('-m0=lzma2', '-mx=1', '-ms=on') }
-        'Balanced' { @('-m0=lzma2', '-mx=5', '-ms=on') }
-        'Maximum' { @('-m0=lzma2', '-mx=9', '-mfb=273', '-md=128m', '-ms=on') }
-    }
-    $zipLevel = if ($Compression -eq 'Fast') { 'Fastest' } else { 'Optimal' }
+    $options = @('-m0=lzma2', '-mx=9', '-mfb=273', '-md=128m', '-ms=on')
+    $zipLevel = 'Optimal'
     $extractorHash = if ($use7z) {
         Assert-NoReparsePath -Path $sevenZipPath
         (Get-FileHash -LiteralPath $sevenZipPath -Algorithm SHA256 -ErrorAction Stop).Hash
     } else { 'dotnet-zip' }
     New-Item -ItemType Directory -Path $ArchiveDir -Force -ErrorAction Stop | Out-Null
     $sourceHash = Get-DriverSourceHash -SourcePath $SourcePath -Files $files -UseMetadataReceipt:$FastRefresh -ReceiptPath $sourceReceiptPath
-    $currentHash = Get-BuildPartsHash -Parts @('driver-archive-v2', $sourceHash, $Compression, ($options -join ' '), $zipLevel, $extractorHash)
+    # Preserve the previous Maximum identity so existing verified archives remain reusable.
+    $currentHash = Get-BuildPartsHash -Parts @('driver-archive-v2', $sourceHash, 'Maximum', ($options -join ' '), $zipLevel, $extractorHash)
     if (-not $currentHash) { return $null }
 
     if (-not $ForceRebuild -and (Test-Path -LiteralPath $archivePath) -and (Test-Path -LiteralPath $hashPath)) {
@@ -1416,11 +1404,11 @@ function Invoke-DriverArchive {
         if ($storedHash -eq $expectedHash) {
             $sizeMB = [math]::Round((Get-Item $archivePath).Length / 1MB, 0)
             Write-StepSkipped "Drivers ($Label): archive current ($sizeMB MB, no changes)"
-            Write-BuildLog "Driver cache HIT: $archivePath (content, extractor and $Compression receipt verified)"
+            Write-BuildLog "Driver cache HIT: $archivePath (content, extractor and Maximum receipt verified)"
             return $archivePath
         }
     }
-    Write-BuildLog "Driver cache MISS: $archivePath ($Compression)"
+    Write-BuildLog "Driver cache MISS: $archivePath (Maximum profile; 7-Zip maximum compression or ZIP Optimal)"
 
     New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
 
@@ -1429,7 +1417,8 @@ function Invoke-DriverArchive {
     Remove-Item -LiteralPath $stagingArchive -Force -ErrorAction SilentlyContinue
 
     if ($use7z) {
-        Start-Step "Compressing drivers ($Label): $($files.Count) files, $uncompressedMB MB (7z LZMA2)"
+        Write-Aside 'Maximum 7-Zip compression is slower for new or changed archives; unchanged cached archives are reused.'
+        Start-Step "Compressing drivers ($Label): $($files.Count) files, $uncompressedMB MB (7z LZMA2 Maximum)"
         Invoke-Tool -FilePath $sevenZipPath -What "7z archive ($Label)" -ArgumentList (@(
             'a', '-t7z') + $options + @(
             '-xr!Drivers.7z', '-xr!Drivers.zip', '-xr!Drivers.7z.hash', '-xr!Drivers.zip.hash',
@@ -1437,8 +1426,8 @@ function Invoke-DriverArchive {
         Invoke-Tool -FilePath $sevenZipPath -ArgumentList @('t', $stagingArchive) -What 'Test new archive with runtime extractor'
     }
     else {
-        Write-Aside 'No compatible runtime extractor supplied. Using .NET ZIP.'
-        Start-Step "Compressing drivers ($Label): $($files.Count) files, $uncompressedMB MB (ZIP deflate)"
+        Write-Aside 'No runtime extractor supplied. Using .NET ZIP Optimal.'
+        Start-Step "Compressing drivers ($Label): $($files.Count) files, $uncompressedMB MB (ZIP Optimal)"
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [IO.Compression.ZipFile]::Open($stagingArchive, [IO.Compression.ZipArchiveMode]::Create)
         try {
@@ -1575,11 +1564,6 @@ function Invoke-DriverPreparation {
     Assert-NoReparsePath -Path $preparedDriversRoot -Recurse
     $extractor = Join-Path $ScriptRoot 'tools\7za.exe'
     $script:RuntimeExtractor = if (Test-Path -LiteralPath $extractor -PathType Leaf) { Assert-RuntimeExtractor -Path $extractor }
-
-    if ($NoZip) {
-        Write-Host "  Using raw drivers from: $driversRoot" -ForegroundColor Green
-        return
-    }
 
     if ($Device) {
         if ($Device -in @('.', '..') -or $Device -match '[\\/:*?"<>|]') { throw 'Device must be a single model folder name.' }
@@ -1797,7 +1781,13 @@ if ($PSCmdlet.ParameterSetName -ne 'ValidateUsb') {
     $script:BuildLog = Join-Path $artifactRoot 'build.log'
     Assert-NoReparsePath -Path $script:BuildLog
     Set-Content -LiteralPath $script:BuildLog -Value "AutoReset + KillDisk build - $(Get-Date)" -ErrorAction Stop
-    Write-BuildLog "Version: $($script:Version)`nScriptRoot: $ScriptRoot`nWorkDir: $WorkDir`nNoCache: $NoCache`nSkipPayload: $SkipPayload`nDriverCompression: $DriverCompression"
+    Write-BuildLog "Version: $($script:Version)`nScriptRoot: $ScriptRoot`nWorkDir: $WorkDir`nNoCache: $NoCache`nSkipPayload: $SkipPayload`nStrictVerify: $StrictVerify`nDriver archives: 7-Zip Maximum / ZIP Optimal"
+    if ($FastRefresh) {
+        Write-Aside 'Fast verification is on (default): unchanged size+timestamp files reuse cached hashes and skip USB/ISO comparison reads. Use -StrictVerify for full SHA256 verification.'
+    }
+    else {
+        Write-Aside 'Strict verification is on: files are content-verified, including driver sources. This can take much longer; valid caches are still reused.'
+    }
 }
 
 switch ($PSCmdlet.ParameterSetName) {
@@ -1914,13 +1904,6 @@ if ($ScriptRoot -like '*OneDrive*') {
     Write-Aside "This folder is inside OneDrive. Work folder moved to $WorkDir to avoid sync issues."
     Write-Aside 'Consider moving the whole kit to a plain local folder like C:\AutoReset.'
 }
-if ($FastRefresh) {
-    Write-Aside 'Fast refresh is on: unchanged size+timestamp files reuse cached hashes and skip USB comparison reads.'
-}
-else {
-    Write-Aside 'Strict refresh is on: every unchanged file will be content-verified. This can take much longer.'
-}
-
 # ── Step 2: Prepare work folder ─────────────────────────────────────
 
 Start-Step 'Preparing work folder'
