@@ -69,7 +69,7 @@ Describe 'KillDisk child process result' {
         }
 
         It 'fails if any required KillDisk runtime script is missing' {
-            $mediaRoot = Join-Path $TestDrive 'media\Payload'
+            $mediaRoot = Join-Path $TestDrive 'media-missing\Payload'
             $scripts = Join-Path $mediaRoot 'Scripts'
             New-Item -ItemType Directory -Path $scripts -Force | Out-Null
             Set-Content -LiteralPath (Join-Path $scripts 'killdisk.ps1') -Value '# killdisk' -Encoding UTF8

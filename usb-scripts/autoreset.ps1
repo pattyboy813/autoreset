@@ -530,12 +530,17 @@ function Stage-KillDiskRuntime {
 
     $stageRoot = 'X:\Windows\Temp\AutoReset-KillDisk'
     if (-not (Test-Path -LiteralPath 'X:\Windows\Temp')) {
-        $stageRoot = Join-Path $env:TEMP 'AutoReset-KillDisk'
+        $tempRoot = $env:TEMP
+        if ([string]::IsNullOrWhiteSpace($tempRoot)) {
+            $tempRoot = [System.IO.Path]::GetTempPath().TrimEnd('\', '/')
+        }
+        $stageRoot = Join-Path $tempRoot 'AutoReset-KillDisk'
     }
     New-Item -ItemType Directory -Path $stageRoot -Force -ErrorAction Stop | Out-Null
 
     foreach ($relative in $required) {
-        $destination = Join-Path $stageRoot ([System.IO.Path]::GetFileName($relative))
+        $normalizedRelative = ($relative -replace '\\', '/')
+        $destination = Join-Path $stageRoot ([System.IO.Path]::GetFileName($normalizedRelative))
         Copy-Item -LiteralPath $resolved[$relative] -Destination $destination -Force -ErrorAction Stop
     }
     return (Join-Path $stageRoot 'killdisk.ps1')
