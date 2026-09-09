@@ -413,6 +413,15 @@ Describe 'Content-based cache and archive refresh' {
         try { $zip.Entries.Count | Should -Be 1 }
         finally { $zip.Dispose() }
     }
+    It 'reuses driver source hash receipts for unchanged files' {
+        $archive = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir
+        Test-Path -LiteralPath "$archive.source.json" | Should -BeTrue
+        Mock Get-FileHash { throw 'Source hash should be reused from receipt.' } -ParameterFilter {
+            $LiteralPath -eq $script:DriverFile
+        }
+        { Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir } | Should -Not -Throw
+        Should -Invoke Get-FileHash -Times 0 -ParameterFilter { $LiteralPath -eq $script:DriverFile }
+    }
     It 'rejects non-Windows and non-AMD64 extractors before executing them' {
         Mock Invoke-Tool { }
         $extractor = Join-Path $TestDrive '7za.exe'

@@ -1056,7 +1056,13 @@ function Sync-BuildFiles {
         $existing = @(Get-ChildItem -LiteralPath $destRoot -Recurse -Force -ErrorAction Stop)
     }
     $copied = 0L; $skipped = 0L; $copiedBytes = 0L; $skippedBytes = 0L
+    $totalFiles = $plan.Count
+    $currentFile = 0
     foreach ($entry in $plan) {
+        $currentFile++
+        if (($currentFile -eq 1) -or ($currentFile -eq $totalFiles) -or (($currentFile % 20) -eq 0)) {
+            Update-StepDisplay ("Refreshing deployment stick: checking file {0}/{1}" -f $currentFile, $totalFiles)
+        }
         $same = $false
         if (Test-Path -LiteralPath $entry.TargetPath -PathType Leaf) {
             $target = Get-Item -LiteralPath $entry.TargetPath -Force -ErrorAction Stop
@@ -1214,17 +1220,64 @@ function Assert-RuntimeExtractor {
 # ── Driver archive change detection ─────────────────────────────────
 
 function Get-DriverSourceHash {
-    param([Parameter(Mandatory)][string]$SourcePath, [object[]]$Files)
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [object[]]$Files,
+        [switch]$UseMetadataReceipt,
+        [string]$ReceiptPath
+    )
     if (-not $PSBoundParameters.ContainsKey('Files')) {
         Assert-NoReparsePath -Path $SourcePath -Recurse
         $Files = @(Get-ChildItem -LiteralPath $SourcePath -Recurse -File -Force -ErrorAction Stop |
             Where-Object { $_.Name -notin @('Drivers.zip', 'Drivers.7z', 'Drivers.7z.hash', 'Drivers.zip.hash') })
     }
     if ($Files.Count -eq 0) { return $null }
+    $cached = @{}
+    if ($UseMetadataReceipt -and $ReceiptPath -and (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) {
+        try {
+            $receipt = ConvertFrom-Json (Get-Content -LiteralPath $ReceiptPath -Raw -ErrorAction Stop)
+            if ($receipt -and $receipt.Version -eq 1 -and $receipt.Files) {
+                foreach ($item in $receipt.Files) {
+                    if (-not $item.RelativePath -or -not $item.Hash) { continue }
+                    $cached[[string]$item.RelativePath] = $item
+                }
+            }
+        }
+        catch {
+            Write-BuildLog "Driver source hash receipt unreadable; recalculating: $ReceiptPath"
+        }
+    }
     $root = [IO.Path]::GetFullPath($SourcePath).TrimEnd('\', '/')
+    $receiptFiles = New-Object System.Collections.Generic.List[object]
     $parts = foreach ($file in ($Files | Sort-Object FullName)) {
         $relative = $file.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
-        "$relative|$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
+        $lastWrite = $file.LastWriteTimeUtc.ToString('o')
+        $length = [long]$file.Length
+        $hash = $null
+        if ($UseMetadataReceipt -and $cached.ContainsKey($relative)) {
+            $hit = $cached[$relative]
+            if ([long]$hit.Length -eq $length -and [string]$hit.LastWriteUtc -eq $lastWrite -and
+                "$($hit.Hash)" -match '^[0-9A-Fa-f]{64}$') {
+                $hash = [string]$hit.Hash
+            }
+        }
+        if (-not $hash) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        }
+        $receiptFiles.Add([pscustomobject]@{
+            RelativePath = $relative
+            Length = $length
+            LastWriteUtc = $lastWrite
+            Hash = $hash
+        }) | Out-Null
+        "$relative|$hash"
+    }
+    if ($UseMetadataReceipt -and $ReceiptPath) {
+        $payload = [pscustomobject]@{
+            Version = 1
+            Files = $receiptFiles
+        }
+        Set-Content -LiteralPath $ReceiptPath -Value ($payload | ConvertTo-Json -Depth 4) -Encoding UTF8
     }
     return Get-BuildPartsHash -Parts $parts
 }
@@ -1252,8 +1305,9 @@ function Invoke-DriverArchive {
     $archiveExt   = if ($use7z) { '7z' } else { 'zip' }
     $archivePath  = Join-Path $ArchiveDir "Drivers.$archiveExt"
     $hashPath     = "$archivePath.hash"
+    $sourceReceiptPath = "$archivePath.source.json"
     $staleExt = if ($use7z) { 'zip' } else { '7z' }
-    foreach ($stale in @("Drivers.$staleExt", "Drivers.$staleExt.hash")) {
+    foreach ($stale in @("Drivers.$staleExt", "Drivers.$staleExt.hash", "Drivers.$staleExt.source.json")) {
         $stalePath = Join-Path $ArchiveDir $stale
         if (Test-Path -LiteralPath $stalePath) { Remove-Item -LiteralPath $stalePath -Force -ErrorAction Stop }
     }
@@ -1268,7 +1322,7 @@ function Invoke-DriverArchive {
         Assert-NoReparsePath -Path $sevenZipPath
         (Get-FileHash -LiteralPath $sevenZipPath -Algorithm SHA256 -ErrorAction Stop).Hash
     } else { 'dotnet-zip' }
-    $sourceHash = Get-DriverSourceHash -SourcePath $SourcePath -Files $files
+    $sourceHash = Get-DriverSourceHash -SourcePath $SourcePath -Files $files -UseMetadataReceipt -ReceiptPath $sourceReceiptPath
     $currentHash = Get-BuildPartsHash -Parts @('driver-archive-v2', $sourceHash, $Compression, ($options -join ' '), $zipLevel, $extractorHash)
     if (-not $currentHash) { return $null }
 
