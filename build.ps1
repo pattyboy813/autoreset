@@ -1061,7 +1061,8 @@ function Sync-BuildFiles {
     foreach ($entry in $plan) {
         $currentFile++
         if (($currentFile -eq 1) -or ($currentFile -eq $totalFiles) -or (($currentFile % 20) -eq 0)) {
-            Update-StepDisplay ("Refreshing deployment stick: checking file {0}/{1}" -f $currentFile, $totalFiles)
+            $percent = [int][math]::Floor((100 * $currentFile) / [math]::Max(1, $totalFiles))
+            Update-StepDisplay $percent
         }
         $same = $false
         if (Test-Path -LiteralPath $entry.TargetPath -PathType Leaf) {
@@ -1256,7 +1257,10 @@ function Get-DriverSourceHash {
         $hash = $null
         if ($UseMetadataReceipt -and $cached.ContainsKey($relative)) {
             $hit = $cached[$relative]
-            if ([long]$hit.Length -eq $length -and [string]$hit.LastWriteUtc -eq $lastWrite -and
+            $cachedStamp = $null
+            try { $cachedStamp = [datetime]::Parse([string]$hit.LastWriteUtc).ToUniversalTime() } catch { }
+            if ([long]$hit.Length -eq $length -and $cachedStamp -and
+                [math]::Abs(($cachedStamp - $file.LastWriteTimeUtc).TotalSeconds) -le 2 -and
                 "$($hit.Hash)" -match '^[0-9A-Fa-f]{64}$') {
                 $hash = [string]$hit.Hash
             }
