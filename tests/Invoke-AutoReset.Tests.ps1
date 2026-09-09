@@ -72,9 +72,10 @@ Describe 'Deployment structure and shared UI integration' {
         $script:DeploymentSource | Should -Match "'Disk Selection' -Width 800 -MinimumHeight 450"
         $script:DeploymentSource | Should -Match 'Initialize-DiskList -List \$list -RowCount'
     }
-    It 'shows loading bars during prepare and step execution' {
-        $script:DeploymentSource | Should -Match '\$pbSplash\.Style\s*=\s*''Marquee'''
-        $script:DeploymentSource | Should -Match '\$pbStep\.Style\s*=\s*''Marquee'''
+    It 'keeps splash text-only and only enables step bars for recordable percentages' {
+        $script:DeploymentSource | Should -Not -Match '\$pbSplash\.Style\s*='
+        $script:DeploymentSource | Should -Not -Match '\$pbStep\.Style\s*=\s*''Marquee'''
+        $script:DeploymentSource | Should -Match '\$pbStep\.Style\s*=\s*''Continuous'''
     }
     It 'runs preflight before its only destructive deployment step' {
         $script:DeploymentSteps[0].Name | Should -Be 'Preflight'
