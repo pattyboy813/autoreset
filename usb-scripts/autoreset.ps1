@@ -34,8 +34,8 @@ function Write-BootstrapLog {
 }
 Write-BootstrapLog "Startup begin: $PSCommandPath"
 
-# The launcher gives PowerShell its own console. Define these helpers before
-# loading optional UI code so failures can reveal it after the UI hides it.
+# Startup launches PowerShell hidden. Define these helpers before loading
+# optional UI code so in-app failures can reveal the console for diagnostics.
 try {
     Add-Type -Name ConsoleUtil -Namespace Ar -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
@@ -1023,7 +1023,7 @@ catch {
 # STAGE 1: SPLASH - Preparing AutoReset (5-second minimum)
 # ═════════════════════════════════════════════════════════════════════
 
-$splashForm = New-BaseForm -TitleSuffix 'Preparing...' -Width 480
+$splashForm = New-BaseForm -TitleSuffix 'Preparing...' -Width 480 -MinimumHeight 80
 
 $lblSplash              = New-Object System.Windows.Forms.Label
 $lblSplash.Text         = 'Preparing AutoReset and gathering info...'

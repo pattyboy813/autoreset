@@ -1148,15 +1148,17 @@ Describe 'Optional WinPE display mode' {
         Test-Path -LiteralPath (Join-Path $TestDrive 'winpe-unattend.xml') | Should -BeFalse
         Get-Content -LiteralPath (Join-Path $TestDrive 'winpeshl.ini') -Raw | Should -Not -Match 'unattend'
         Get-Content -LiteralPath (Join-Path $TestDrive 'startnet.cmd') -Raw | Should -Not -Match 'unattend'
-        Get-Content -LiteralPath (Join-Path $TestDrive 'AutoReset-Startup.cmd') -Raw | Should -Not -Match 'unattend'
+        Test-Path -LiteralPath (Join-Path $TestDrive 'AutoReset-Startup.cmd') | Should -BeFalse
     }
     It 'generates Display only when explicitly requested' {
         Set-WinPEStartup -System32Path $TestDrive -Resolution '1280x720'
         [xml]$xml = Get-Content -LiteralPath (Join-Path $TestDrive 'winpe-unattend.xml') -Raw
         $xml.unattend.settings.component.Display.HorizontalResolution | Should -Be '1280'
         $xml.unattend.settings.component.Display.VerticalResolution | Should -Be '720'
-        Get-Content -LiteralPath (Join-Path $TestDrive 'AutoReset-Startup.cmd') -Raw |
+        Get-Content -LiteralPath (Join-Path $TestDrive 'startnet.cmd') -Raw |
             Should -Match 'wpeinit.exe" -unattend:X:\\Windows\\System32\\winpe-unattend.xml'
+        Get-Content -LiteralPath (Join-Path $TestDrive 'winpeshl.ini') -Raw |
+            Should -Match 'wpeinit.exe, -unattend:X:\\Windows\\System32\\winpe-unattend.xml'
     }
     It 'removes a stale explicit resolution when returning to defaults' {
         Set-WinPEStartup -System32Path $TestDrive -Resolution '1920x1200'
@@ -1165,146 +1167,47 @@ Describe 'Optional WinPE display mode' {
     }
 }
 
-Describe 'Visible WinPE startup supervisor' {
+Describe 'Direct WinPE startup' {
     BeforeEach {
         Set-WinPEStartup -System32Path $TestDrive
-        $script:Launcher = Get-Content -LiteralPath (Join-Path $TestDrive 'AutoReset-Startup.cmd') -Raw
     }
-    It 'routes both entrypoints through the same persistent CMD supervisor' {
-        foreach ($name in @('winpeshl.ini', 'startnet.cmd')) {
-            $entrypoint = Get-Content -LiteralPath (Join-Path $TestDrive $name) -Raw
-            $entrypoint | Should -Match 'cmd.exe"?[,]? /d /k'
-            $entrypoint | Should -Match '%SYSTEMROOT%\\System32\\AutoReset-Startup.cmd'
-            $entrypoint | Should -Not -Match 'powershell|wpeinit|WindowStyle'
-        }
+    It 'initializes WinPE once before directly launching hidden STA PowerShell in <Name>' -ForEach @(
+        @{ Name = 'winpeshl.ini'; Prefix = '%SYSTEMROOT%\System32\WindowsPowerShell\v1.0\powershell.exe, ' }
+        @{ Name = 'startnet.cmd'; Prefix = '"%SYSTEMROOT%\System32\WindowsPowerShell\v1.0\powershell.exe" ' }
+    ) {
+        $entrypoint = Get-Content -LiteralPath (Join-Path $TestDrive $Name) -Raw
+        ([regex]::Matches($entrypoint, 'wpeinit\.exe')).Count | Should -Be 1
+        ([regex]::Matches($entrypoint, 'powershell\.exe')).Count | Should -Be 1
+        $entrypoint.IndexOf('wpeinit.exe') | Should -BeLessThan $entrypoint.IndexOf('powershell.exe')
+        $expected = $Prefix + '-NoLogo -NoProfile -NonInteractive -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "%SYSTEMDRIVE%\Payload\Scripts\autoreset.ps1"'
+        ($entrypoint -split '\r?\n') | Should -Contain $expected
+        $entrypoint | Should -Not -Match 'cmd\.exe|/k|AutoReset-Startup|AutoReset-Launcher|>>|2>&1|pause|goto'
     }
-    It 'initializes WinPE once and stops on failure before launching deployment' {
-        ([regex]::Matches($script:Launcher, '(?m)^"%SYSTEMROOT%\\System32\\wpeinit.exe"')).Count | Should -Be 1
-        $script:Launcher | Should -Match '(?s)wpeinit.exe" >>"%StartupLog%" 2>&1\r\nset "StartupExitCode=%errorlevel%".*?if not "%StartupExitCode%"=="0" goto stopped.*?start "AutoReset runtime"'
-        $script:Launcher | Should -Match 'if not exist "%SYSTEMROOT%\\System32\\wpeinit.exe" goto stopped'
+    It 'does not create a supervisor or launcher logs when none exist' {
+        Test-Path -LiteralPath (Join-Path $TestDrive 'AutoReset-Startup.cmd') | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $TestDrive -File).Name | Should -Be @('startnet.cmd', 'winpeshl.ini')
     }
-    It 'checks for a missing executable and script before launching PowerShell' {
-        $script:Launcher | Should -Match 'if not exist "%SYSTEMROOT%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" goto stopped'
-        $script:Launcher | Should -Match 'if not exist "%SYSTEMDRIVE%\\Payload\\Scripts\\autoreset.ps1" goto stopped'
+    It 'removes only the stale builder-owned supervisor when refreshing startup' {
+        $stale = Join-Path $TestDrive 'AutoReset-Startup.cmd'
+        $unrelated = Join-Path $TestDrive 'other-startup.cmd'
+        Set-Content -LiteralPath $stale -Value 'old supervisor'
+        Set-Content -LiteralPath $unrelated -Value 'user content'
+        Set-WinPEStartup -System32Path $TestDrive
+        Test-Path -LiteralPath $stale | Should -BeFalse
+        Get-Content -LiteralPath $unrelated | Should -Be 'user content'
+        { Set-WinPEStartup -System32Path $TestDrive } | Should -Not -Throw
     }
-    It 'waits for a separate console and captures the actual child exit code' {
-        $script:Launcher | Should -Match 'start "AutoReset runtime" /wait "%SYSTEMROOT%\\System32\\cmd.exe" /d /c ""%~f0" child"'
-        $script:Launcher | Should -Not -Match '(?im)^start .* /b |WindowStyle Hidden'
-        $script:Launcher | Should -Match '(?s)start "AutoReset runtime".*?\r\nset "StartupExitCode=%errorlevel%"'
-        $script:Launcher | Should -Match '(?s):child\r\n.*?-NonInteractive -STA .*?-File .*? >>"%SYSTEMROOT%\\Temp\\AutoReset-Startup.log" 2>&1\r\nexit /b %errorlevel%'
-        $script:Launcher.IndexOf('if /i "%~1"=="child" goto child') |
-            Should -BeLessThan $script:Launcher.IndexOf('wpeinit.exe')
-    }
-    It 'uses distinct log files for the waiting parent and the runtime child' {
-        $script:Launcher | Should -Match 'set "LauncherLog=%SYSTEMROOT%\\Temp\\AutoReset-Launcher.log"'
-        $script:Launcher | Should -Match 'set "StartupLog=%SYSTEMROOT%\\Temp\\AutoReset-Startup.log"'
-        $parent = [regex]::Match($script:Launcher, '(?m)^start "AutoReset runtime".*').Value
-        $parent | Should -Match ' >"%LauncherLog%" 2>&1'
-        $parent | Should -Not -Match '%StartupLog%|AutoReset-Startup.log'
-        $child = ($script:Launcher -split ':child\r\n', 2)[1] -split ':stopped\r\n', 2 | Select-Object -First 1
-        $child | Should -Match ' >>"%SYSTEMROOT%\\Temp\\AutoReset-Startup.log" 2>&1'
-        $child | Should -Not -Match '%LauncherLog%|AutoReset-Launcher.log'
-    }
-    It 'shows errors and log paths using only CMD builtins and never retries or reboots' {
-        $diagnostics = ($script:Launcher -split ':stopped\r\n', 2)[1]
-        $diagnostics | Should -Match 'type "%StartupLog%"'
-        $diagnostics | Should -Match 'type "%LauncherLog%"'
-        $diagnostics | Should -Match 'echo Launcher log: "%LauncherLog%"'
-        $diagnostics | Should -Match 'type "%SYSTEMROOT%\\Temp\\AutoReset-Bootstrap.log"'
-        $diagnostics | Should -Match 'if exist "%SYSTEMROOT%\\Temp\\AutoReset.log" type "%SYSTEMROOT%\\Temp\\AutoReset.log"'
-        $diagnostics.LastIndexOf('type "') | Should -BeLessThan $diagnostics.IndexOf('echo ===== AUTORESET STOPPED =====')
-        $diagnostics | Should -Match 'echo Exit code: %StartupExitCode%'
-        foreach ($log in @('AutoReset.log', 'AutoReset-Detail.log', 'SMSTSLog\smsts.log', 'wpeinit.log')) {
-            $diagnostics | Should -Match ([regex]::Escape($log))
-        }
-        $diagnostics | Should -Not -Match '(?im)^(?:pause|timeout|choice|powershell|start |goto |.*wpeutil.exe)'
-        $diagnostics | Should -Match 'command prompt below'
-        $script:Launcher | Should -Match 'Exit code 0 can also mean cancellation or an unexpected return'
-    }
-    It 'generates an ASCII CRLF batch file without a byte-order mark' {
-        $bytes = [IO.File]::ReadAllBytes((Join-Path $TestDrive 'AutoReset-Startup.cmd'))
-        $bytes[0] | Should -Be 64
+    It 'generates ASCII <Name> without a byte-order mark' -ForEach @(
+        @{ Name = 'startnet.cmd'; FirstByte = 64 }
+        @{ Name = 'winpeshl.ini'; FirstByte = 91 }
+    ) {
+        $bytes = [IO.File]::ReadAllBytes((Join-Path $TestDrive $Name))
+        $bytes[0] | Should -Be $FirstByte
         @($bytes | Where-Object { $_ -gt 127 }).Count | Should -Be 0
-        $script:Launcher | Should -Not -Match '(?<!\r)\n'
-        $script:Launcher | Should -Not -Match '__WPEINIT_ARGS__'
     }
     It 'includes the startup helper in runtime cache invalidation' {
         [IO.File]::ReadAllText($script:BuilderPath) |
             Should -Match "(?s)foreach \(\`$helper in @\([^)]*'Set-WinPEStartup'.*?runtimeParts \+="
-    }
-}
-
-# These tests execute only generated launchers patched to harmless local fixtures.
-# They validate Windows CMD behavior, not WinPE or the destructive runtime.
-Describe 'Windows startup launcher fault injection' -Skip:($env:OS -ne 'Windows_NT') {
-    It 'retains diagnostics for <Fault>' -ForEach @(
-        @{ Fault = 'missing initializer'; InitExit = 0; Child = ''; ExpectedExit = 2; Expected = 'Missing WinPE initializer'; RunsChild = $false }
-        @{ Fault = 'initialization failure'; InitExit = 23; Child = 'throw "must not run"'; ExpectedExit = 23; Expected = 'fake init output'; RunsChild = $false }
-        @{ Fault = 'missing PowerShell'; InitExit = 0; Child = ''; ExpectedExit = 2; Expected = 'Missing PowerShell'; RunsChild = $false }
-        @{ Fault = 'missing runtime'; InitExit = 0; Child = ''; ExpectedExit = 2; Expected = 'Missing AutoReset script'; RunsChild = $false }
-        @{ Fault = 'parse failure'; InitExit = 0; Child = 'function Broken {'; ExpectedExit = 1; Expected = 'ParserError'; RunsChild = $true }
-        @{ Fault = 'runtime failure'; InitExit = 0; Child = 'Write-Output "fake stdout"; [Console]::Error.WriteLine("fake stderr"); exit 17'; ExpectedExit = 17; Expected = 'fake stderr'; RunsChild = $true }
-        @{ Fault = 'unexpected clean return'; InitExit = 0; Child = 'Write-Output "fake clean return"; exit 0'; ExpectedExit = 0; Expected = 'fake clean return'; RunsChild = $true }
-    ) {
-        $fixture = Join-Path $TestDrive "safe startup $Fault"
-        $null = New-Item -ItemType Directory -Path $fixture -Force
-        Set-WinPEStartup -System32Path $fixture
-        $launcherPath = Join-Path $fixture 'AutoReset-Startup.cmd'
-        $initPath = Join-Path $fixture 'fake-init.cmd'
-        $childPath = Join-Path $fixture 'fake-runtime.ps1'
-        $logPath = Join-Path $fixture 'AutoReset-Startup.log'
-        $launcherLogPath = Join-Path $fixture 'AutoReset-Launcher.log'
-        $consolePath = Join-Path $fixture 'console.log'
-        $markerPath = Join-Path $fixture 'child-launched'
-        $psPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        Set-Content -LiteralPath $initPath -Encoding Ascii -Value @(
-            '@echo off', 'echo fake init output', "exit /b $InitExit")
-        Set-Content -LiteralPath $childPath -Encoding Ascii -Value $Child
-        Set-Content -LiteralPath (Join-Path $fixture 'AutoReset-Bootstrap.log') -Encoding Ascii -Value 'fake bootstrap diagnostic'
-        Set-Content -LiteralPath (Join-Path $fixture 'AutoReset.log') -Encoding Ascii -Value 'fake runtime diagnostic'
-        if ($Fault -eq 'missing initializer') { Remove-Item -LiteralPath $initPath }
-        if ($Fault -eq 'missing runtime') { Remove-Item -LiteralPath $childPath }
-        if ($Fault -eq 'missing PowerShell') { $psPath = Join-Path $fixture 'missing-powershell.exe' }
-        $launcher = [IO.File]::ReadAllText($launcherPath)
-        $launcher = $launcher.Replace(
-            '"%SYSTEMROOT%\System32\wpeinit.exe" >>', 'call "' + $initPath + '" >>')
-        $launcher = $launcher.Replace('%SYSTEMROOT%\System32\wpeinit.exe', $initPath)
-        $launcher = $launcher.Replace('%SYSTEMROOT%\System32\WindowsPowerShell\v1.0\powershell.exe', $psPath)
-        $launcher = $launcher.Replace('%SYSTEMDRIVE%\Payload\Scripts\autoreset.ps1', $childPath)
-        $launcher = $launcher.Replace('%SYSTEMROOT%\Temp', $fixture)
-        $launcher = $launcher.Replace(":child`r`n", ":child`r`n>""$markerPath"" echo launched`r`n")
-        $launcher | Should -Not -Match '%SYSTEMDRIVE%\\Payload|%SYSTEMROOT%\\System32\\wpeinit.exe'
-        [IO.File]::WriteAllText($launcherPath, $launcher, [Text.Encoding]::ASCII)
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
-        # /c lets the test collect output; production /k retention is checked above.
-        $psi.Arguments = '/d /c ""' + $launcherPath + '" >"' + $consolePath + '" 2>&1"'
-        $psi.UseShellExecute = $false
-        $process = [Diagnostics.Process]::Start($psi)
-        try {
-            $process.WaitForExit(30000) | Should -BeTrue
-            $output = [IO.File]::ReadAllText($consolePath)
-            $output | Should -Match "Exit code: $ExpectedExit"
-            $output | Should -Match $Expected
-            $output | Should -Match 'AUTORESET STOPPED'
-            $output | Should -Match 'fake bootstrap diagnostic'
-            $output | Should -Match 'fake runtime diagnostic'
-            $output.IndexOf('fake runtime diagnostic') | Should -BeLessThan $output.IndexOf('AUTORESET STOPPED')
-            $output | Should -Match ([regex]::Escape($launcherLogPath))
-            [IO.File]::ReadAllText($logPath) | Should -Match $Expected
-            Test-Path -LiteralPath $markerPath | Should -Be $RunsChild
-            if ($RunsChild) {
-                Test-Path -LiteralPath $launcherLogPath | Should -BeTrue
-                [IO.File]::ReadAllText($launcherLogPath) | Should -Not -Match $Expected
-            }
-            $initCount = if ($Fault -eq 'missing initializer') { 0 } else { 1 }
-            ([regex]::Matches([IO.File]::ReadAllText($logPath), 'fake init output')).Count | Should -Be $initCount
-            if ($Fault -eq 'runtime failure') { $output | Should -Match 'fake stdout' }
-        }
-        finally {
-            if (-not $process.HasExited) { $process.Kill() }
-            $process.Dispose()
-        }
     }
 }
 

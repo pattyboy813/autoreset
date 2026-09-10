@@ -48,11 +48,11 @@
     same eligible physical USB disk and the builder's Payload\UNE-Payload.tag
     ownership marker. Logs are preserved during payload refresh.
 
-    Boot startup failures remain in a visible command prompt with the exit code
-    and captured output in X:\Windows\Temp\AutoReset-Startup.log. Bootstrap and
-    runtime log paths are also displayed. Photograph or copy these RAM-disk logs
-    before rebooting; the launcher does not retry deployment or reboot on failure.
-    Rebuild/update the USB with -UpdateUsb (or rebuild the ISO) to install launcher
+    WinPE initializes once, then launches AutoReset directly in hidden STA
+    PowerShell. In-app diagnostics remain in X:\Windows\Temp\AutoReset-Bootstrap.log
+    and the runtime logs; no startup supervisor or launcher logs are generated.
+    Copy these RAM-disk logs before rebooting.
+    Rebuild/update the USB with -UpdateUsb (or rebuild the ISO) to install startup
     changes in boot.wim; copying runtime scripts alone does not update startup.
 
 .PARAMETER OutputRoot
@@ -1247,92 +1247,20 @@ function Set-WinPEStartup {
         $wpeinitArgs = ' -unattend:X:\Windows\System32\winpe-unattend.xml'
     }
     elseif (Test-Path -LiteralPath $unattendPath) { Remove-Item -LiteralPath $unattendPath -Force -ErrorAction Stop }
+    $legacyLauncherPath = Join-Path $System32Path 'AutoReset-Startup.cmd'
+    if (Test-Path -LiteralPath $legacyLauncherPath -PathType Leaf) {
+        Remove-Item -LiteralPath $legacyLauncherPath -Force -ErrorAction Stop
+    }
+    $powerShellPath = '%SYSTEMROOT%\System32\WindowsPowerShell\v1.0\powershell.exe'
+    $powerShellArgs = '-NoLogo -NoProfile -NonInteractive -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "%SYSTEMDRIVE%\Payload\Scripts\autoreset.ps1"'
     Set-Content -LiteralPath (Join-Path $System32Path 'winpeshl.ini') -Encoding Ascii -Value @(
         '[LaunchApps]',
-        '%SYSTEMROOT%\System32\cmd.exe, /d /k "%SYSTEMROOT%\System32\AutoReset-Startup.cmd"')
+        ('%SYSTEMROOT%\System32\wpeinit.exe' + $(if ($wpeinitArgs) { ',' + $wpeinitArgs })),
+        ($powerShellPath + ', ' + $powerShellArgs))
     Set-Content -LiteralPath (Join-Path $System32Path 'startnet.cmd') -Encoding Ascii -Value @(
         '@echo off',
-        '"%SYSTEMROOT%\System32\cmd.exe" /d /k ""%SYSTEMROOT%\System32\AutoReset-Startup.cmd""')
-    # A separate console keeps the supervisor visible when the runtime hides its own.
-    # /k in both entrypoints retains diagnostics without depending on pause/stdin.
-    $launcher = @'
-@echo off
-setlocal EnableExtensions DisableDelayedExpansion
-if /i "%~1"=="child" goto child
-title AutoReset startup supervisor
-set "StartupLog=%SYSTEMROOT%\Temp\AutoReset-Startup.log"
-set "LauncherLog=%SYSTEMROOT%\Temp\AutoReset-Launcher.log"
-set "StartupStage=creating the startup log"
-set "StartupExitCode=1"
-set "StartupFailure=Cannot create the startup log."
-if not exist "%SYSTEMROOT%\Temp" mkdir "%SYSTEMROOT%\Temp"
->"%StartupLog%" echo AutoReset startup: %date% %time%
-if errorlevel 1 goto stopped
-echo AutoReset is starting. This window will retain diagnostics if startup fails.
-set "StartupStage=initializing WinPE"
-set "StartupExitCode=2"
-set "StartupFailure=Missing WinPE initializer: %SYSTEMROOT%\System32\wpeinit.exe"
-if not exist "%SYSTEMROOT%\System32\wpeinit.exe" goto stopped
-"%SYSTEMROOT%\System32\wpeinit.exe"__WPEINIT_ARGS__ >>"%StartupLog%" 2>&1
-set "StartupExitCode=%errorlevel%"
-set "StartupFailure=WinPE initialization failed."
-if not "%StartupExitCode%"=="0" goto stopped
-set "StartupStage=checking the PowerShell runtime"
-set "StartupExitCode=2"
-set "StartupFailure=Missing PowerShell: %SYSTEMROOT%\System32\WindowsPowerShell\v1.0\powershell.exe"
-if not exist "%SYSTEMROOT%\System32\WindowsPowerShell\v1.0\powershell.exe" goto stopped
-set "StartupFailure=Missing AutoReset script: %SYSTEMDRIVE%\Payload\Scripts\autoreset.ps1"
-if not exist "%SYSTEMDRIVE%\Payload\Scripts\autoreset.ps1" goto stopped
-set "StartupStage=running AutoReset"
-start "AutoReset runtime" /wait "%SYSTEMROOT%\System32\cmd.exe" /d /c ""%~f0" child" >"%LauncherLog%" 2>&1
-set "StartupExitCode=%errorlevel%"
-set "StartupFailure=AutoReset returned without rebooting. Exit code 0 can also mean cancellation or an unexpected return."
-goto stopped
-
-:child
-"%SYSTEMROOT%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File "%SYSTEMDRIVE%\Payload\Scripts\autoreset.ps1" >>"%SYSTEMROOT%\Temp\AutoReset-Startup.log" 2>&1
-exit /b %errorlevel%
-
-:stopped
->>"%StartupLog%" echo Stage: %StartupStage%
->>"%StartupLog%" echo Exit code: %StartupExitCode%
->>"%StartupLog%" echo %StartupFailure%
-echo.
-echo ===== Bootstrap log, if available =====
-if exist "%SYSTEMROOT%\Temp\AutoReset-Bootstrap.log" type "%SYSTEMROOT%\Temp\AutoReset-Bootstrap.log"
-echo.
-echo ===== Captured startup output =====
-if exist "%StartupLog%" type "%StartupLog%"
-echo.
-echo ===== Launcher errors, if available =====
-if exist "%LauncherLog%" type "%LauncherLog%"
-echo.
-echo ===== Runtime log, if available =====
-if exist "%SYSTEMROOT%\Temp\AutoReset.log" type "%SYSTEMROOT%\Temp\AutoReset.log"
-echo.
-echo ===== AUTORESET STOPPED =====
-echo Stage: %StartupStage%
-echo Exit code: %StartupExitCode%
-echo %StartupFailure%
-echo.
-echo Startup log: "%StartupLog%"
-echo Launcher log: "%LauncherLog%"
-echo Bootstrap log: "%SYSTEMROOT%\Temp\AutoReset-Bootstrap.log"
-echo Runtime log: "%SYSTEMROOT%\Temp\AutoReset.log"
-echo Detail log: "%SYSTEMROOT%\Temp\AutoReset-Detail.log"
-echo Task sequence log: "%SYSTEMROOT%\Temp\SMSTSLog\smsts.log"
-echo WinPE initialization log: "%SYSTEMROOT%\System32\wpeinit.log"
-echo.
-echo Photograph this error or copy the logs before rebooting: X: is a RAM disk.
-echo No deployment retry or automatic reboot will be attempted by this launcher.
-echo The command prompt below is available for diagnosis; use TYPE to read logs.
-echo Do not run startnet or AutoReset again. Closing this shell may restart WinPE.
-endlocal
-exit /b
-'@
-    $launcher = $launcher.Replace('__WPEINIT_ARGS__', $wpeinitArgs)
-    [IO.File]::WriteAllText((Join-Path $System32Path 'AutoReset-Startup.cmd'),
-        ($launcher -replace '\r?\n', "`r`n") + "`r`n", [Text.Encoding]::ASCII)
+        ('"%SYSTEMROOT%\System32\wpeinit.exe"' + $wpeinitArgs),
+        ('"' + $powerShellPath + '" ' + $powerShellArgs))
 }
 
 function Assert-RuntimeExtractor {

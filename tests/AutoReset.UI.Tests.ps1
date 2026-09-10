@@ -13,6 +13,23 @@ Describe 'WinPE UI startup fallbacks' {
     It 'centers forms through the public StartPosition property' {
         $script:UiSource | Should -Match '\$form\.StartPosition\s*=\s*''CenterScreen'''
     }
+    It 'uses a splash-only compact minimum while retaining content-aware sizing' {
+        $path = Join-Path $PSScriptRoot '../usb-scripts/autoreset.ps1'
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errors)
+        $errors.Count | Should -Be 0
+        $assignment = @($ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq '$splashForm'
+        }, $true))
+        $assignment.Count | Should -Be 1
+        $assignment[0].Right.Extent.Text | Should -Be "New-BaseForm -TitleSuffix 'Preparing...' -Width 480 -MinimumHeight 80"
+        $source = [IO.File]::ReadAllText($path)
+        $source | Should -Match '(?s)Set-FormSize -Form \$splashForm.*?\$splashForm\.Show\(\)'
+        $source | Should -Match '\[int\]\$MinimumHeight = 260'
+        $script:UiSource | Should -Match '\[int\]\$MinimumHeight = 260'
+    }
     It 'never calls protected form-centering methods in <Name>' -ForEach @(
         @{ Name = 'autoreset.ps1' }, @{ Name = 'killdisk.ps1' }, @{ Name = 'autoreset.ui.ps1' }
     ) {
@@ -105,5 +122,41 @@ Describe 'WinForms disk layout' -Skip:($env:OS -ne 'Windows_NT') {
             $form.ClientSize.Width | Should -BeLessOrEqual ([int](500 * $form._UiScale))
         }
         finally { $form.Dispose() }
+    }
+    It 'fits the actual text-only splash in compact bounds without cropping' {
+        $path = Join-Path $PSScriptRoot '../usb-scripts/autoreset.ps1'
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
+        $helpers = $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -in @('Title', 'New-BaseForm')
+        }, $true)
+        . ([scriptblock]::Create(($helpers.Extent.Text -join "`n")))
+        # Extract only form construction and layout; never run deployment entrypoints.
+        $statements = @($ast.EndBlock.Statements)
+        $start = 0
+        while ($statements[$start].Extent.Text -notlike '$splashForm =*') { $start++ }
+        $end = $start
+        while ($statements[$end].Extent.Text -ne 'Set-FormSize -Form $splashForm') { $end++ }
+        $splashForm = $null
+        try {
+            . ([scriptblock]::Create(($statements[$start..$end].Extent.Text -join "`n")))
+            $splashForm.Show()
+            [System.Windows.Forms.Application]::DoEvents()
+            $splashForm.Tag.Controls.Count | Should -Be 1
+            $label = $splashForm.Tag.Controls[0]
+            $label | Should -BeOfType ([System.Windows.Forms.Label])
+            $label.Text | Should -Be 'Preparing AutoReset and gathering info...'
+            $splashForm.ClientSize.Height | Should -BeLessThan (260 * $splashForm._UiScale)
+            $splashForm.ClientSize.Height | Should -BeGreaterOrEqual $splashForm.Tag.Height
+            $preferred = $label.GetPreferredSize((New-Object System.Drawing.Size($label.Width, 0)))
+            $label.Height | Should -BeGreaterOrEqual $preferred.Height
+            $label.Right | Should -BeLessOrEqual ($splashForm.Tag.Width - $splashForm.Tag.Padding.Right)
+            $label.Bottom | Should -BeLessOrEqual ($splashForm.Tag.Height - $splashForm.Tag.Padding.Bottom)
+            $viewport = $splashForm.RectangleToScreen($splashForm.ClientRectangle)
+            $labelBounds = $splashForm.Tag.RectangleToScreen($label.Bounds)
+            $viewport.Contains($labelBounds) | Should -BeTrue
+        }
+        finally { if ($null -ne $splashForm) { $splashForm.Dispose() } }
     }
 }
