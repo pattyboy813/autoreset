@@ -34,8 +34,8 @@ function Write-BootstrapLog {
 }
 Write-BootstrapLog "Startup begin: $PSCommandPath"
 
-# The launcher starts PowerShell hidden. Define these helpers before loading any
-# optional UI code so an early failure can reveal the console.
+# The launcher gives PowerShell its own console. Define these helpers before
+# loading optional UI code so failures can reveal it after the UI hides it.
 try {
     Add-Type -Name ConsoleUtil -Namespace Ar -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
