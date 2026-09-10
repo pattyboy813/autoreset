@@ -634,10 +634,12 @@ function Get-CachedFileHash {
     param(
         [Parameter(Mandatory)][string]$Path,
         [string]$ReceiptDirectory,
-        [switch]$TrustMetadata
+        [switch]$TrustMetadata,
+        [ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$VerifiedHash
     )
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     if ([string]::IsNullOrWhiteSpace($ReceiptDirectory)) {
+        if ($VerifiedHash) { return $VerifiedHash.ToUpperInvariant() }
         return (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
     }
 
@@ -649,7 +651,7 @@ function Get-CachedFileHash {
     Assert-NoReparsePath -Path $ReceiptDirectory
     Assert-NoReparsePath -Path $receiptPath
 
-    if ($TrustMetadata -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+    if (-not $VerifiedHash -and $TrustMetadata -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
         try {
             $receipt = Get-Content -LiteralPath $receiptPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             if ($receipt.Version -eq 1 -and [string]$receipt.Path -ceq $item.FullName -and
@@ -662,7 +664,9 @@ function Get-CachedFileHash {
         catch { Write-BuildLog "Hash receipt unreadable; recalculating: $receiptPath" }
     }
 
-    $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+    # Publication can supply the hash of its verified, same-volume staging file.
+    $hash = if ($VerifiedHash) { $VerifiedHash.ToUpperInvariant() }
+        else { (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash }
     if (-not (Test-Path -LiteralPath $ReceiptDirectory -PathType Container)) {
         New-Item -ItemType Directory -Path $ReceiptDirectory -Force | Out-Null
     }
@@ -1355,6 +1359,71 @@ function Get-DriverSourceHash {
     return Get-BuildPartsHash -Parts $parts
 }
 
+function Move-DriverArchiveStage {
+    param(
+        [Parameter(Mandatory)][string]$Stage,
+        [Parameter(Mandatory)][string]$Destination
+    )
+    $Stage = [IO.Path]::GetFullPath($Stage)
+    $Destination = [IO.Path]::GetFullPath($Destination)
+    if ((Split-Path -Parent $Stage) -ne (Split-Path -Parent $Destination) -or $Stage -eq $Destination) {
+        throw 'Driver archive replacement requires distinct sibling files.'
+    }
+    Assert-NoReparsePath -Path $Stage
+    Assert-NoReparsePath -Path $Destination
+    if (-not (Test-Path -LiteralPath $Stage -PathType Leaf) -or
+        (Test-Path -LiteralPath $Destination -PathType Container)) {
+        throw 'Driver archive replacement requires regular files.'
+    }
+    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        # Never delete the cache first; filesystems without Replace support fail closed.
+        [IO.File]::Replace($Stage, $Destination, [NullString]::Value)
+    }
+    else { [IO.File]::Move($Stage, $Destination) }
+}
+
+function Publish-DriverArchive {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination
+    )
+    $Source = [IO.Path]::GetFullPath($Source)
+    $Destination = [IO.Path]::GetFullPath($Destination)
+    $directory = Split-Path -Parent $Destination
+    Assert-NoReparsePath -Path $Source
+    Assert-NoReparsePath -Path $Destination
+    if ($Source -eq $Destination -or -not (Test-Path -LiteralPath $Source -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $directory -PathType Container) -or
+        (Test-Path -LiteralPath $Destination -PathType Container)) {
+        throw 'Driver archive publication requires a source file and a safe destination directory.'
+    }
+    $stage = Join-Path $directory ('.driver-archive-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $hash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256 -ErrorAction Stop).Hash
+        Copy-Item -LiteralPath $Source -Destination $stage -ErrorAction Stop
+        Assert-NoReparsePath -Path $stage
+        if ((Get-FileHash -LiteralPath $stage -Algorithm SHA256 -ErrorAction Stop).Hash -ne $hash) {
+            throw 'Driver archive publication copy failed SHA256 verification.'
+        }
+        if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+            # A crash after replacement must not reuse old same-size metadata receipts.
+            $oldStamp = (Get-Item -LiteralPath $Destination -Force -ErrorAction Stop).LastWriteTimeUtc
+            [IO.File]::SetLastWriteTimeUtc($stage, $oldStamp.AddSeconds(2))
+            if ((Get-Item -LiteralPath $stage -Force -ErrorAction Stop).LastWriteTimeUtc -eq $oldStamp) {
+                throw 'Unable to invalidate old driver archive metadata.'
+            }
+        }
+        Move-DriverArchiveStage -Stage $stage -Destination $Destination
+        return $hash
+    }
+    catch {
+        throw "Driver archive publication failed; compressed source retained at '$Source': $($_.Exception.Message)"
+    }
+    finally {
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Force -ErrorAction Stop }
+    }
+}
+
 function Invoke-DriverArchive {
     param(
         [Parameter(Mandatory)][string]$SourcePath,
@@ -1378,6 +1447,11 @@ function Invoke-DriverArchive {
     $archivePath  = Join-Path $ArchiveDir "Drivers.$archiveExt"
     $hashPath     = "$archivePath.hash"
     $sourceReceiptPath = "$archivePath.source.json"
+    foreach ($path in @($archivePath, $hashPath, $sourceReceiptPath)) {
+        if (Test-Path -LiteralPath $path -PathType Container) {
+            throw "Driver archive and receipt paths must be regular files: $path"
+        }
+    }
     $staleExt = if ($use7z) { 'zip' } else { '7z' }
     foreach ($stale in @("Drivers.$staleExt", "Drivers.$staleExt.hash", "Drivers.$staleExt.source.json")) {
         $stalePath = Join-Path $ArchiveDir $stale
@@ -1402,7 +1476,7 @@ function Invoke-DriverArchive {
         catch { Write-BuildLog "Driver cache MISS (unreadable receipt): $archivePath" }
         $expectedHash = "$currentHash|$(Get-CachedFileHash -Path $archivePath -ReceiptDirectory (Join-Path $ArchiveDir 'ArtifactHashes') -TrustMetadata:$FastRefresh)"
         if ($storedHash -eq $expectedHash) {
-            $sizeMB = [math]::Round((Get-Item $archivePath).Length / 1MB, 0)
+            $sizeMB = [math]::Round((Get-Item -LiteralPath $archivePath).Length / 1MB, 0)
             Write-StepSkipped "Drivers ($Label): archive current ($sizeMB MB, no changes)"
             Write-BuildLog "Driver cache HIT: $archivePath (content, extractor and Maximum receipt verified)"
             return $archivePath
@@ -1440,10 +1514,22 @@ function Invoke-DriverArchive {
         finally { $zip.Dispose() }
     }
 
-    Move-Item -LiteralPath $stagingArchive -Destination $archivePath -Force
-    Set-Content -LiteralPath $hashPath -Value "$currentHash|$(Get-CachedFileHash -Path $archivePath -ReceiptDirectory (Join-Path $ArchiveDir 'ArtifactHashes'))" -Encoding UTF8
+    $archiveHash = Publish-DriverArchive -Source $stagingArchive -Destination $archivePath
+    # Only publish a success receipt after replacement and metadata refresh succeed.
+    # Keep the compressed source if either receipt write fails.
+    if (Test-Path -LiteralPath $hashPath) { Remove-Item -LiteralPath $hashPath -Force -ErrorAction Stop }
+    $null = Get-CachedFileHash -Path $archivePath -ReceiptDirectory (Join-Path $ArchiveDir 'ArtifactHashes') -VerifiedHash $archiveHash
+    $hashStage = Join-Path $ArchiveDir ('.driver-hash-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        Set-Content -LiteralPath $hashStage -Value "$currentHash|$archiveHash" -Encoding UTF8 -ErrorAction Stop
+        Move-DriverArchiveStage -Stage $hashStage -Destination $hashPath
+    }
+    finally {
+        if (Test-Path -LiteralPath $hashStage) { Remove-Item -LiteralPath $hashStage -Force -ErrorAction Stop }
+    }
+    Remove-Item -LiteralPath $stagingArchive -Force -ErrorAction Stop
 
-    $compressedMB = [math]::Round((Get-Item $archivePath).Length / 1MB, 0)
+    $compressedMB = [math]::Round((Get-Item -LiteralPath $archivePath).Length / 1MB, 0)
     $ratio = if ($uncompressedMB -gt 0) { [math]::Round((1 - $compressedMB / $uncompressedMB) * 100, 0) } else { 0 }
     Write-StepDone "Compressed drivers ($Label): $uncompressedMB MB -> $compressedMB MB ($ratio% smaller)"
     Write-BuildLog "Driver archive built: $archivePath (hash $currentHash)"

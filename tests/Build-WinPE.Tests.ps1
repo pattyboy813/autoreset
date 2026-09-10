@@ -632,14 +632,13 @@ Describe 'Content-based cache and archive refresh' {
         $oldKey = Get-BuildPartsHash -Parts @('driver-archive-v2',
             (Get-DriverSourceHash -SourcePath $script:DriverSource), $Profile, $Options, $ZipLevel, 'dotnet-zip')
         Set-Content -LiteralPath "$archive.hash" -Value "$oldKey|$((Get-FileHash -LiteralPath $archive).Hash)"
-        Mock Move-Item {
-            [IO.File]::Copy($LiteralPath, $Destination, $true)
-            [IO.File]::Delete($LiteralPath)
+        Mock Copy-Item {
+            [IO.File]::Copy($LiteralPath, $Destination)
         }
         Mock Invoke-Tool { throw 'ZIP fallback must not execute any extractor.' }
         $null = Invoke-DriverArchive -SourcePath $script:DriverSource -ArchiveDir $script:ArchiveDir -FastRefresh
         (Get-Content -LiteralPath "$archive.hash" -Raw).Trim() | Should -Be $maximumReceipt
-        Should -Invoke Move-Item -Times $Builds -Exactly -ParameterFilter { $Destination -eq $archive }
+        Should -Invoke Copy-Item -Times $Builds -Exactly -ParameterFilter { $LiteralPath -like '*Drivers-*.zip' }
         Should -Invoke Invoke-Tool -Times 0
     }
     It 'uses ZIP Optimal when no validated runtime extractor is supplied' {
