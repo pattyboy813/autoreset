@@ -46,12 +46,13 @@ Describe 'KillDisk child process result' {
     }
 
     Describe 'KillDisk local staging' {
-        It 'copies required KillDisk scripts to local runtime storage' {
+        It 'copies required KillDisk scripts without changing their UTF-16LE packaging' {
             $mediaRoot = Join-Path $TestDrive 'media\Payload'
             $scripts = Join-Path $mediaRoot 'Scripts'
             New-Item -ItemType Directory -Path $scripts -Force | Out-Null
             foreach ($name in @('killdisk.ps1', 'autoreset.common.ps1', 'autoreset.ui.ps1')) {
-                Set-Content -LiteralPath (Join-Path $scripts $name) -Value "# $name" -Encoding UTF8
+                [IO.File]::WriteAllText((Join-Path $scripts $name),
+                    ("# $name " + [char]0x2192), [Text.UnicodeEncoding]::new($false, $true, $true))
             }
             $tempBefore = $env:TEMP
             try {
@@ -61,6 +62,9 @@ Describe 'KillDisk child process result' {
                 $staged | Should -Be (Join-Path $stageRoot 'killdisk.ps1')
                 foreach ($name in @('killdisk.ps1', 'autoreset.common.ps1', 'autoreset.ui.ps1')) {
                     Test-Path -LiteralPath (Join-Path $stageRoot $name) | Should -BeTrue
+                    @([IO.File]::ReadAllBytes((Join-Path $stageRoot $name))[0..1]) | Should -Be @(0xFF, 0xFE)
+                    (Get-FileHash -LiteralPath (Join-Path $stageRoot $name)).Hash |
+                        Should -Be (Get-FileHash -LiteralPath (Join-Path $scripts $name)).Hash
                 }
             }
             finally {

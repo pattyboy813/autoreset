@@ -309,7 +309,7 @@ Describe 'Canonical sources and safe payload defaults' {
         Test-Path -LiteralPath (Join-Path $dest 'Scripts/stale.ps1') | Should -BeFalse
         Should -Invoke Invoke-Robocopy -Times 1 -ParameterFilter { $Extra -contains '/MIR' }
     }
-    It 'bundles Unicode runtime sources with a UTF-8 BOM for Windows PowerShell 5.1' {
+    It 'bundles Unicode runtime sources with a UTF-16LE BOM for Windows PowerShell 5.1' {
         Mock Invoke-Robocopy { }
         $source = Join-Path $script:Sources 'autoreset.ui.ps1'
         $text = '$label = "' + [char]0x2192 + '"'
@@ -318,17 +318,156 @@ Describe 'Canonical sources and safe payload defaults' {
         Sync-RuntimePayload -Destination $dest -RuntimeFiles @(Get-RuntimeSourceFiles -Root $script:Sources) -PayloadSource $script:PayloadSource
         foreach ($scriptFile in Get-ChildItem -LiteralPath (Join-Path $dest 'Scripts') -File) {
             [byte[]]$bytes = [IO.File]::ReadAllBytes($scriptFile.FullName)
-            @($bytes[0..2]) | Should -Be @(0xEF, 0xBB, 0xBF)
+            @($bytes[0..1]) | Should -Be @(0xFF, 0xFE)
         }
         [IO.File]::ReadAllText((Join-Path $dest 'Scripts/autoreset.ui.ps1')) | Should -Be $text
         [IO.File]::ReadAllBytes($source)[0] | Should -Not -Be 0xEF
     }
-    It 'does not duplicate an existing runtime BOM' {
+    It 'normalizes <CaseName> without changing source bytes or recopying unchanged output' -ForEach @(
+        @{ CaseName = 'BOM-free UTF-8'; Bom = $false; ExtraBoms = 0 }
+        @{ CaseName = 'UTF-8 BOM'; Bom = $true; ExtraBoms = 0 }
+        @{ CaseName = 'duplicate UTF-8 BOMs'; Bom = $true; ExtraBoms = 2 }
+    ) {
         $source = Join-Path $script:Sources 'autoreset.ui.ps1'
         $dest = Join-Path $TestDrive 'bom-script.ps1'
-        [IO.File]::WriteAllText($source, "'hello'", [Text.UTF8Encoding]::new($true))
+        [IO.File]::WriteAllText($source, (([string][char]0xFEFF) * $ExtraBoms + "'hello'"), [Text.UTF8Encoding]::new($Bom))
+        $sourceHash = (Get-FileHash -LiteralPath $source).Hash
         Copy-RuntimeScript -Source $source -Destination $dest
-        (Get-FileHash -LiteralPath $dest).Hash | Should -Be (Get-FileHash -LiteralPath $source).Hash
+        @([IO.File]::ReadAllBytes($dest)[0..5]) | Should -Be @(0xFF, 0xFE, 0x27, 0, 0x68, 0)
+        [IO.File]::ReadAllText($dest) | Should -Be "'hello'"
+        $packagedHash = (Get-FileHash -LiteralPath $dest).Hash
+        (Get-Item -LiteralPath $dest).LastWriteTimeUtc = [datetime]'2001-01-01'
+        $stamp = (Get-Item -LiteralPath $dest).LastWriteTimeUtc
+        Copy-RuntimeScript -Source $source -Destination $dest
+        (Get-Item -LiteralPath $dest).LastWriteTimeUtc | Should -Be $stamp
+        (Get-FileHash -LiteralPath $dest).Hash | Should -Be $packagedHash
+        (Get-FileHash -LiteralPath $source).Hash | Should -Be $sourceHash
+    }
+    It 'rejects <CaseName> before creating or overwriting a destination' -ForEach @(
+        @{ CaseName = 'literal question marks'; Prefix = '??' }
+        @{ CaseName = 'mojibake BOM'; Prefix = ([string][char]0xEF + [char]0xBB + [char]0xBF) }
+        @{ CaseName = 'replacement characters'; Prefix = ([string][char]0xFFFD) * 2 }
+        @{ CaseName = 'BOM followed by malformed prefix'; Prefix = ([string][char]0xFEFF + '??') }
+        @{ CaseName = 'whitespace followed by malformed prefix'; Prefix = " `r`n??" }
+    ) {
+        $source = Join-Path $script:Sources 'bad-prefix.ps1'
+        $dest = Join-Path $TestDrive "$CaseName-output.ps1"
+        [IO.File]::WriteAllText($source, ($Prefix + "<#`n.SYNOPSIS`nHelp`n#>`n'hello'"), [Text.UTF8Encoding]::new($true))
+        $sourceHash = (Get-FileHash -LiteralPath $source).Hash
+        { Copy-RuntimeScript -Source $source -Destination $dest } | Should -Throw '*Malformed runtime script BOM prefix*'
+        Test-Path -LiteralPath $dest | Should -BeFalse
+        [IO.File]::WriteAllText($dest, 'existing destination')
+        $destHash = (Get-FileHash -LiteralPath $dest).Hash
+        { Copy-RuntimeScript -Source $source -Destination $dest } | Should -Throw '*Malformed runtime script BOM prefix*'
+        (Get-FileHash -LiteralPath $dest).Hash | Should -Be $destHash
+        (Get-FileHash -LiteralPath $source).Hash | Should -Be $sourceHash
+    }
+    It 'rejects syntax errors before writing a destination' {
+        $source = Join-Path $script:Sources 'invalid.ps1'
+        $dest = Join-Path $TestDrive 'invalid-output.ps1'
+        [IO.File]::WriteAllText($source, 'function Broken {', [Text.UTF8Encoding]::new($false))
+        { Copy-RuntimeScript -Source $source -Destination $dest } | Should -Throw '*Invalid runtime script*'
+        Test-Path -LiteralPath $dest | Should -BeFalse
+        [IO.File]::WriteAllText($dest, 'existing destination')
+        $hash = (Get-FileHash -LiteralPath $dest).Hash
+        { Copy-RuntimeScript -Source $source -Destination $dest } | Should -Throw '*Invalid runtime script*'
+        (Get-FileHash -LiteralPath $dest).Hash | Should -Be $hash
+    }
+    It 'rejects invalid UTF-8 bytes without replacing them or writing the destination' {
+        $source = Join-Path $script:Sources 'invalid-utf8.ps1'
+        $dest = Join-Path $TestDrive 'invalid-utf8-output.ps1'
+        [IO.File]::WriteAllBytes($source, [byte[]]@(0xFF, 0x3C, 0x23))
+        { Copy-RuntimeScript -Source $source -Destination $dest } | Should -Throw
+        Test-Path -LiteralPath $dest | Should -BeFalse
+    }
+    It 'preserves embedded BOM characters and BOM-like text in valid strings and comments' {
+        $source = Join-Path $script:Sources 'embedded.ps1'
+        $dest = Join-Path $TestDrive 'embedded-output.ps1'
+        $text = "'??<# " + [char]0xEF + [char]0xBB + [char]0xBF + '<# ' + [char]0xFEFF + "'`n# ??<#"
+        [IO.File]::WriteAllText($source, $text, [Text.UTF8Encoding]::new($true))
+        Copy-RuntimeScript -Source $source -Destination $dest
+        [IO.File]::ReadAllText($dest) | Should -Be $text
+    }
+    It 'parses the exact packaged bytes of every production runtime without running entrypoints' {
+        Mock Invoke-Robocopy { }
+        $runtimeRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'usb-scripts'
+        $files = @(Get-RuntimeSourceFiles -Root $runtimeRoot)
+        $sourceHashes = @{}
+        foreach ($file in $files) { $sourceHashes[$file.Name] = (Get-FileHash -LiteralPath $file.FullName).Hash }
+        $dest = Join-Path $TestDrive 'production-bundle'
+        Sync-RuntimePayload -Destination $dest -RuntimeFiles $files -PayloadSource $script:PayloadSource
+        foreach ($file in $files) {
+            $path = Join-Path $dest "Scripts/$($file.Name)"
+            (Get-FileHash -LiteralPath $file.FullName).Hash | Should -Be $sourceHashes[$file.Name]
+            @([IO.File]::ReadAllBytes($path)[0..1]) | Should -Be @(0xFF, 0xFE)
+            $sourceText = [IO.File]::ReadAllText($file.FullName)
+            [IO.File]::ReadAllText($path) | Should -Be $sourceText
+            $errors = $null
+            $tokens = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+            $errors.Count | Should -Be 0
+            $tokens[0].Kind | Should -Be 'Comment'
+            $tokens[0].Extent.StartOffset | Should -Be 0
+            $sourceAst = [System.Management.Automation.Language.Parser]::ParseInput($sourceText, [ref]$null, [ref]$null)
+            $ast.EndBlock.Statements[0].Extent.Text | Should -Be $sourceAst.EndBlock.Statements[0].Extent.Text
+            $isFunction = { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }
+            $functions = @($ast.FindAll($isFunction, $true).Name)
+            $functions.Count | Should -BeGreaterThan 0
+            $functions | Should -Be @($sourceAst.FindAll($isFunction, $true).Name)
+            if ($file.Name -eq 'autoreset.common.ps1') {
+                $functions | Should -Contain 'Assert-WinPEEnvironment'
+            }
+            else {
+                $tokens[0].Text | Should -Match '^<#'
+                $ast.GetHelpContent().Synopsis | Should -Be $sourceAst.GetHelpContent().Synopsis
+                $ast.GetHelpContent().Synopsis | Should -Not -BeNullOrEmpty
+            }
+            if ($file.Name -eq 'autoreset.ps1') {
+                $functions | Should -Contain 'Write-BootstrapLog'
+                $functions | Should -Contain 'Write-Log'
+            }
+        }
+    }
+    It 'runs only a harmless packaged help prefix in native Windows PowerShell' -Skip:($env:OS -ne 'Windows_NT') {
+        $source = Join-Path $script:Sources 'harmless.ps1'
+        $dest = Join-Path $TestDrive 'harmless-packaged.ps1'
+        $runtime = Join-Path (Split-Path -Parent $PSScriptRoot) 'usb-scripts/autoreset.ps1'
+        $tokens = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseFile($runtime, [ref]$tokens, [ref]$null)
+        # Retain only the production help comment, never the deployment entrypoint.
+        $text = $tokens[0].Text + "`n" + @'
+$ErrorActionPreference = 'Stop'
+function Test-PackagedPrefix { 'PACKAGED-PREFIX-OK' }
+Test-PackagedPrefix
+if ([int][char]'UNICODE' -ne 0x2192) { throw 'Unicode changed' }
+'@
+        $text = $text.Replace('UNICODE', [string][char]0x2192)
+        [IO.File]::WriteAllText($source, $text, [Text.UTF8Encoding]::new($true))
+        Copy-RuntimeScript -Source $source -Destination $dest
+        $powershell = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+        $output = & $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $dest 2>&1
+        $LASTEXITCODE | Should -Be 0
+        "$output" | Should -Be 'PACKAGED-PREFIX-OK'
+    }
+    It 'includes the packaging helper definition in the final WIM cache key only' {
+        $helperLoop = @($script:BuilderAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.ForEachStatementAst] -and
+            $node.Variable.VariablePath.UserPath -eq 'helper'
+        }, $true))
+        $helperLoop.Count | Should -Be 1
+        $runtimeParts = @()
+        # Evaluate only the inert helper-definition collection, not the build entrypoint.
+        . ([scriptblock]::Create($helperLoop[0].Extent.Text))
+        $definition = (Get-Command Copy-RuntimeScript).Definition
+        $runtimeParts | Should -Contain "helper:Copy-RuntimeScript:$definition"
+        $current = Get-WinPECachePlan -CacheDirectory $TestDrive -BaseParts @('base') -RuntimeParts $runtimeParts
+        $previousParts = $runtimeParts | ForEach-Object {
+            $_.Replace('[Text.UnicodeEncoding]::new($false, $true, $true)', '[Text.UTF8Encoding]::new($true, $true)')
+        }
+        $previous = Get-WinPECachePlan -CacheDirectory $TestDrive -BaseParts @('base') -RuntimeParts $previousParts
+        $current.FinalKey | Should -Not -Be $previous.FinalKey
+        $current.BaseKey | Should -Be $previous.BaseKey
     }
     It 'bundles the ADK BIOS deployment tool even without optional payload tools' {
         Mock Invoke-Robocopy { }

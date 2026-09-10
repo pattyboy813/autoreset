@@ -12,7 +12,8 @@
     usb-scripts\autoreset.ui.ps1. These explicit files are bundled into
     boot.wim at Payload\Scripts and mirrored to the deployment media's
     Payload\Scripts; Payload\Scripts is not a source folder. Bundled runtime
-    scripts use UTF-8 with a BOM for Windows PowerShell 5.1. Supply
+    scripts use UTF-16LE with a BOM for Windows PowerShell 5.1; canonical
+    source files remain UTF-8. Supply
     configuration at reset.json. Optional source assets live in win-images,
     device-drivers, tools and winpe-drivers. OutputRoot\Images\install.wim
     takes precedence over win-images\install.wim. An image is required unless
@@ -901,7 +902,18 @@ function Copy-ChangedFile {
 function Copy-RuntimeScript {
     param([string]$Source, [string]$Destination)
     $text = [IO.File]::ReadAllText($Source, [Text.UTF8Encoding]::new($false, $true))
-    $encoding = [Text.UTF8Encoding]::new($true, $true)
+    # ReadAllText consumes one file BOM; remove only additional leading BOM characters.
+    $text = $text.TrimStart([char]0xFEFF)
+    if ($text -match '^\s*(?:\?|\uFFFD|\u00EF\u00BB\u00BF)+\s*<#') {
+        throw "Malformed runtime script BOM prefix: $Source. Restore the UTF-8 source before building."
+    }
+    $parseErrors = $null
+    $null = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$parseErrors)
+    if ($parseErrors.Count) {
+        throw "Invalid runtime script ${Source}: $($parseErrors.Message -join '; ')"
+    }
+    # Package explicitly for Windows PowerShell, without rewriting the canonical source.
+    $encoding = [Text.UnicodeEncoding]::new($false, $true, $true)
     [byte[]]$bytes = $encoding.GetPreamble() + $encoding.GetBytes($text)
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $expectedHash = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '') }
