@@ -36,8 +36,15 @@ Describe 'WinPE UI startup fallbacks' {
         @{ Name = 'autoreset.ps1' }, @{ Name = 'killdisk.ps1' }
     ) {
         $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot "../usb-scripts/$Name") -Raw
-        $source | Should -Match 'Write-(BootstrapLog|Log) "Location: .*InvocationInfo\.PositionMessage'
-        $source | Should -Match 'Write-(BootstrapLog|Log) "Stack: .*ScriptStackTrace'
+        if ($Name -eq 'autoreset.ps1') {
+            $source | Should -Match '"Position: .*InvocationInfo\.PositionMessage'
+            $source | Should -Match '"ScriptStackTrace: .*ScriptStackTrace'
+            $source | Should -Match '\[Console\]::Error\.WriteLine\(\$failureDetails\)'
+        }
+        else {
+            $source | Should -Match 'Write-Log "Location: .*InvocationInfo\.PositionMessage'
+            $source | Should -Match 'Write-Log "Stack: .*ScriptStackTrace'
+        }
     }
 }
 

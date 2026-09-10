@@ -52,9 +52,30 @@ function Hide-Console {
 
 trap {
     $failure = $_
-    Write-BootstrapLog "Unhandled failure: $($failure.Exception.Message)"
-    Write-BootstrapLog "Location: $($failure.InvocationInfo.PositionMessage)"
-    Write-BootstrapLog "Stack: $($failure.ScriptStackTrace)"
+    # Traps are active even before the logging and console functions are defined.
+    try {
+        $failureDetails = @(
+            'AutoReset unhandled failure:'
+            "Exception type: $($failure.Exception.GetType().FullName)"
+            "Message: $($failure.Exception.Message)"
+            "Script: $($failure.InvocationInfo.ScriptName)"
+            "Line: $($failure.InvocationInfo.ScriptLineNumber)"
+            "Position: $($failure.InvocationInfo.PositionMessage)"
+            "ScriptStackTrace: $($failure.ScriptStackTrace)"
+            "FullyQualifiedErrorId: $($failure.FullyQualifiedErrorId)"
+        ) -join [Environment]::NewLine
+        [Console]::Error.WriteLine($failureDetails)
+    }
+    catch { }
+    try { Write-BootstrapLog $failureDetails }
+    catch {
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($script:BootstrapLog)) {
+                [IO.File]::AppendAllText($script:BootstrapLog, $failureDetails + [Environment]::NewLine)
+            }
+        }
+        catch { }
+    }
     try { Show-Console } catch { }
     try { Write-Log "AutoReset stopped: $($failure.Exception.Message)" 'ERROR' } catch { }
     try {
@@ -62,7 +83,7 @@ trap {
             "AutoReset stopped. No further deployment actions will run.`r`n`r`n$($failure.Exception.Message)`r`n`r`nLog: $script:LogFile",
             'AutoReset error', 'OK', 'Error')
     }
-    catch { Write-Host "AutoReset stopped: $($failure.Exception.Message)" -ForegroundColor Red }
+    catch { }
     exit 1
 }
 
@@ -79,18 +100,37 @@ try {
     Write-BootstrapLog 'Startup initialization complete.'
 }
 catch {
-    Write-BootstrapLog "Startup initialization failed: $($_.Exception.Message)"
-    Write-BootstrapLog "Line: $($_.InvocationInfo.ScriptLineNumber)"
-    Show-Console
+    $failure = $_
+    try {
+        $failureDetails = @(
+            'AutoReset startup initialization failed:'
+            "Exception type: $($failure.Exception.GetType().FullName)"
+            "Message: $($failure.Exception.Message)"
+            "Script: $($failure.InvocationInfo.ScriptName)"
+            "Line: $($failure.InvocationInfo.ScriptLineNumber)"
+            "Position: $($failure.InvocationInfo.PositionMessage)"
+            "ScriptStackTrace: $($failure.ScriptStackTrace)"
+            "FullyQualifiedErrorId: $($failure.FullyQualifiedErrorId)"
+        ) -join [Environment]::NewLine
+        [Console]::Error.WriteLine($failureDetails)
+    }
+    catch { }
+    try { Write-BootstrapLog $failureDetails }
+    catch {
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($script:BootstrapLog)) {
+                [IO.File]::AppendAllText($script:BootstrapLog, $failureDetails + [Environment]::NewLine)
+            }
+        }
+        catch { }
+    }
+    try { Show-Console } catch { }
     try {
         [void][System.Windows.Forms.MessageBox]::Show(
-            "AutoReset failed before the Preparing screen.`r`n`r`n$($_.Exception.Message)`r`n`r`nBootstrap log: $($script:BootstrapLog)",
+            "AutoReset failed before the Preparing screen.`r`n`r`n$($failure.Exception.Message)`r`n`r`nBootstrap log: $($script:BootstrapLog)",
             'AutoReset startup error', 'OK', 'Error')
     }
-    catch {
-        Write-Host "AutoReset startup failed: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "Bootstrap log: $($script:BootstrapLog)" -ForegroundColor Yellow
-    }
+    catch { }
     exit 1
 }
 

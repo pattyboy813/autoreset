@@ -131,7 +131,139 @@ Describe 'Deployment structure and shared UI integration' {
         if ($hideConsole -lt 0) { $hideConsole = $script:DeploymentSource.IndexOf("`nHide-Console`n") }
         $showConsole | Should -BeLessThan $startup
         $hideConsole | Should -BeGreaterThan $startup
-        $script:DeploymentSource | Should -Match '(?s)catch \{\s*Write-BootstrapLog "Startup initialization failed:.*?Show-Console'
+        $script:DeploymentSource | Should -Match '(?s)catch \{\s*\$failure = \$_.*?AutoReset startup initialization failed:.*?try \{ Show-Console \} catch \{ \}'
+    }
+}
+
+Describe 'Runtime failure diagnostics without entrypoint execution' {
+    It 'preserves the original <Handler> error with <Helpers> helpers and <LogPath> bootstrap path' -ForEach @(
+        @{ Handler = 'trap'; Helpers = 'missing'; LogPath = 'unset' }
+        @{ Handler = 'trap'; Helpers = 'missing'; LogPath = 'available' }
+        @{ Handler = 'trap'; Helpers = 'throwing'; LogPath = 'available' }
+        @{ Handler = 'trap'; Helpers = 'throwing'; LogPath = 'invalid' }
+        @{ Handler = 'startup catch'; Helpers = 'missing'; LogPath = 'unset' }
+        @{ Handler = 'startup catch'; Helpers = 'missing'; LogPath = 'available' }
+        @{ Handler = 'startup catch'; Helpers = 'throwing'; LogPath = 'available' }
+        @{ Handler = 'startup catch'; Helpers = 'throwing'; LogPath = 'invalid' }
+    ) {
+        $trapAst = $script:DeploymentAst.EndBlock.Traps[0]
+        $trapAst | Should -Not -BeNullOrEmpty
+        if ($Handler -eq 'trap') {
+            $handlerText = $trapAst.Extent.Text
+        }
+        else {
+            $startupTry = $script:DeploymentAst.EndBlock.Statements | Where-Object {
+                $_ -is [System.Management.Automation.Language.TryStatementAst] -and
+                $_.Body.Extent.Text.Contains("Write-BootstrapLog 'Loading WinForms assemblies.'")
+            }
+            @($startupTry).Count | Should -Be 1
+            $handlerText = $startupTry.CatchClauses[0].Extent.Text
+        }
+        # Only the handler is copied. Substitute the dialog type so no host can show a real UI.
+        ([regex]::Matches($handlerText, '\[System.Windows.Forms.MessageBox\]')).Count | Should -Be 1
+        $dialogType = if ($Helpers -eq 'missing') { '[UnavailableDiagnosticMessageBox]' } else { '[DiagnosticMessageBox]' }
+        $handlerText = $handlerText.Replace('[System.Windows.Forms.MessageBox]', $dialogType)
+        $fixture = Join-Path $TestDrive "$Handler-$Helpers-$LogPath"
+        New-Item -ItemType Directory -Path $fixture | Out-Null
+        $childPath = Join-Path $fixture 'early-failure.ps1'
+        $bootstrapPath = Join-Path $fixture 'AutoReset-Bootstrap.log'
+        if ($LogPath -eq 'invalid') { $bootstrapPath = Join-Path $fixture 'missing-directory/bootstrap.log' }
+        $prefix = @'
+$ErrorActionPreference = 'Stop'
+class DiagnosticMessageBox {
+    static [string] Show([string]$message, [string]$title, [string]$buttons, [string]$icon) {
+        [Console]::Error.WriteLine("Attempt: dialog: $message")
+        throw 'SECONDARY_DIALOG_FAILURE'
+    }
+}
+'@
+        if ($LogPath -ne 'unset') {
+            $prefix += "`n`$script:BootstrapLog = '$($bootstrapPath.Replace("'", "''"))'"
+        }
+        $helperDefinitions = @'
+function Write-BootstrapLog {
+    param($Message)
+    [Console]::Error.WriteLine('Attempt: bootstrap')
+    throw 'SECONDARY_BOOTSTRAP_FAILURE'
+}
+function Show-Console {
+    [Console]::Error.WriteLine('Attempt: console')
+    throw 'SECONDARY_CONSOLE_FAILURE'
+}
+function Write-Log {
+    param($Message, $Level)
+    [Console]::Error.WriteLine("Attempt: runtime log: $Message")
+    throw 'SECONDARY_LOG_FAILURE'
+}
+'@
+        $throw = "throw [System.Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('ORIGINAL_STARTUP_SENTINEL'), 'AutoReset.EarlyFailure', [System.Management.Automation.ErrorCategory]::InvalidOperation, `$null)"
+        if ($Helpers -eq 'throwing') { $prefix += "`n$helperDefinitions" }
+        $child = if ($Handler -eq 'trap') {
+            # The throw precedes both the trap declaration and any uninitialized function definitions.
+            "$prefix`n$throw`n$handlerText"
+        }
+        else {
+            "$prefix`ntry {`n$throw`n}`n$handlerText"
+        }
+        if ($Helpers -eq 'missing') { $child += "`n$helperDefinitions" }
+        $child += "`n[Console]::Error.WriteLine('UNEXPECTED_CONTINUATION')"
+        Set-Content -LiteralPath $childPath -Value $child -Encoding UTF8
+        $childErrors = $null
+        $childAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $childPath, [ref]$null, [ref]$childErrors)
+        $childErrors.Count | Should -Be 0
+        $throwAst = $childAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.ThrowStatementAst] -and
+            $node.Extent.Text.Contains('ORIGINAL_STARTUP_SENTINEL')
+        }, $true)
+        $line = $throwAst.Extent.StartLineNumber
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = (Get-Process -Id $PID).Path
+        $psi.Arguments = '-NoLogo -NoProfile -NonInteractive -File "' + $childPath + '"'
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardError = $true
+        $psi.RedirectStandardOutput = $true
+        $process = [Diagnostics.Process]::Start($psi)
+        try {
+            $stderr = $process.StandardError.ReadToEndAsync()
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $process.WaitForExit(30000) | Should -BeTrue
+            $process.ExitCode | Should -Be 1
+            $output = $stderr.GetAwaiter().GetResult()
+            $output | Should -Match '^AutoReset (unhandled failure|startup initialization failed):'
+            $output | Should -Match 'Exception type: System.InvalidOperationException'
+            $output | Should -Match 'Message: ORIGINAL_STARTUP_SENTINEL'
+            $output | Should -Match ('Script: ' + [regex]::Escape($childPath))
+            $output | Should -Match "(?m)^Line: $line\r?$"
+            $output | Should -Match "Position: At .*:$line char:"
+            $output | Should -Match ('ScriptStackTrace: at <ScriptBlock>, ' + [regex]::Escape($childPath) + ": line $line")
+            $output | Should -Match 'FullyQualifiedErrorId: AutoReset.EarlyFailure'
+            $output | Should -Not -Match 'SECONDARY_|UNEXPECTED_CONTINUATION|not recognized'
+            $stdout.GetAwaiter().GetResult() | Should -BeNullOrEmpty
+            if ($Helpers -eq 'throwing') {
+                $output | Should -Match 'Attempt: bootstrap'
+                $output | Should -Match 'Attempt: console'
+                $output | Should -Match '(?s)Attempt: dialog: AutoReset.*ORIGINAL_STARTUP_SENTINEL'
+                if ($Handler -eq 'trap') {
+                    $output | Should -Match 'Attempt: runtime log: AutoReset stopped: ORIGINAL_STARTUP_SENTINEL'
+                }
+            }
+            else {
+                $output | Should -Not -Match 'Attempt:'
+            }
+            if ($LogPath -eq 'available') {
+                $logged = Get-Content -LiteralPath $bootstrapPath -Raw
+                $logged.TrimEnd() | Should -Be (($output -split 'Attempt:', 2)[0].TrimEnd())
+            }
+            else {
+                Test-Path -LiteralPath $bootstrapPath | Should -BeFalse
+            }
+        }
+        finally {
+            if (-not $process.HasExited) { $process.Kill() }
+            $process.Dispose()
+        }
     }
 }
 
