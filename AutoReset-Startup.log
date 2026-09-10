@@ -1,0 +1,13 @@
+AutoReset startup: Thu 09/10/2026 12:08:53.60
+Write-BootstrapLog : The term 'Write-BootstrapLog' is not recognized as the name of a cmdlet, function, script file, 
+or operable program. Check the spelling of the name, or if a path was included, verify that the path is correct and 
+try again.
+At X:\Payload\Scripts\autoreset.ps1:55 char:5
++     Write-BootstrapLog "Unhandled failure: $($failure.Exception.Messa ...
++     ~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-BootstrapLog:String) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Stage: running AutoReset
+Exit code: 1
+AutoReset returned without rebooting. Exit code 0 can also mean cancellation or an unexpected return.
