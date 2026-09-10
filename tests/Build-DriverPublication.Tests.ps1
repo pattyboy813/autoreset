@@ -45,6 +45,7 @@ Describe 'Destination-side driver archive publication' {
         $hash = Publish-DriverArchive -Source $source -Destination $destination
         $hash | Should -Be (Get-FileHash -LiteralPath $source).Hash
         [IO.File]::ReadAllText($destination) | Should -Be 'NEW ARCHIVE'
+        @(Get-ChildItem -LiteralPath $cache -Force -Filter '*.bak').Count | Should -Be 0
         Should -Invoke Move-Item -Times 0
         Should -Invoke Remove-Item -Times 0 -ParameterFilter { $LiteralPath -eq $destination }
     }
@@ -77,13 +78,94 @@ Describe 'Destination-side driver archive publication' {
                 Mock Get-FileHash { throw 'source hash failure' } -ParameterFilter { $LiteralPath -eq $source }
             }
             'replacement' {
-                Mock Move-DriverArchiveStage { throw [PlatformNotSupportedException]::new('Replace unavailable') }
+                Mock Invoke-DriverArchiveReplacement { throw [PlatformNotSupportedException]::new('Replace unavailable') }
             }
         }
         { Publish-DriverArchive -Source $source -Destination $destination } | Should -Throw '*source retained*'
         [IO.File]::ReadAllText($destination) | Should -Be 'OLD ARCHIVE'
         [IO.File]::ReadAllText("$destination.hash") | Should -Be 'old-success-receipt'
         [IO.File]::ReadAllText($receipt) | Should -Be $oldReceipt
+        @(Get-ChildItem -LiteralPath $cache -Force -Filter '*.bak').Count | Should -Be 0
+    }
+    It 'restores the old cache when replacement moves it to backup before failing' {
+        Mock Invoke-DriverArchiveReplacement {
+            (Split-Path -Parent $Backup) | Should -Be (Split-Path -Parent $Destination)
+            Test-Path -LiteralPath $Backup | Should -BeFalse
+            [IO.File]::Move($Destination, $Backup)
+            [IO.File]::ReadAllText($Stage) | Should -Be 'NEW ARCHIVE'
+            throw [IO.IOException]::new('ERROR_UNABLE_TO_MOVE_REPLACEMENT (1176)')
+        }
+        { Publish-DriverArchive -Source $source -Destination $destination } |
+            Should -Throw '*1176*Previous archive restored*'
+        [IO.File]::ReadAllText($destination) | Should -Be 'OLD ARCHIVE'
+        [IO.File]::ReadAllText("$destination.hash") | Should -Be 'old-success-receipt'
+        [IO.File]::ReadAllText($receipt) | Should -Be $oldReceipt
+        @(Get-ChildItem -LiteralPath $cache -Force -Filter '*.bak').Count | Should -Be 0
+    }
+    It 'retains and identifies the backup and source when safe restoration fails' {
+        Mock Invoke-DriverArchiveReplacement {
+            [IO.File]::Move($Destination, $Backup)
+            throw 'partial replacement failure'
+        }
+        Mock Assert-NoReparsePath { throw 'restore validation failure' } -ParameterFilter {
+            $Path -like '*.bak' -and [IO.File]::Exists($Path)
+        }
+        $failure = { Publish-DriverArchive -Source $source -Destination $destination } |
+            Should -Throw '*Automatic restore failed*restore validation failure*' -PassThru
+        $backups = @(Get-ChildItem -LiteralPath $cache -Force -Filter '*.bak')
+        $backups.Count | Should -Be 1
+        [IO.File]::ReadAllText($backups[0].FullName) | Should -Be 'OLD ARCHIVE'
+        $failure.Exception.Message.Contains($backups[0].FullName) | Should -BeTrue
+        $failure.Exception.Message.Contains($source) | Should -BeTrue
+        Test-Path -LiteralPath $destination | Should -BeFalse
+    }
+    It 'does not overwrite a <Kind> destination after a failed replacement' -ForEach @(
+        @{ Kind = 'file' }, @{ Kind = 'directory' }
+    ) {
+        Mock Invoke-DriverArchiveReplacement {
+            [IO.File]::Move($Destination, $Backup)
+            if ($Kind -eq 'file') { [IO.File]::WriteAllText($Destination, 'OTHER ARCHIVE') }
+            else { [IO.Directory]::CreateDirectory($Destination) | Out-Null }
+            throw 'partial replacement failure'
+        }
+        Mock Remove-Item { throw 'Never remove a live destination' } -ParameterFilter { $LiteralPath -eq $destination }
+        $failure = { Publish-DriverArchive -Source $source -Destination $destination } |
+            Should -Throw '*existing destination left untouched*' -PassThru
+        $backups = @(Get-ChildItem -LiteralPath $cache -Force -Filter '*.bak')
+        $backups.Count | Should -Be 1
+        [IO.File]::ReadAllText($backups[0].FullName) | Should -Be 'OLD ARCHIVE'
+        $failure.Exception.Message.Contains($backups[0].FullName) | Should -BeTrue
+        if ($Kind -eq 'file') { [IO.File]::ReadAllText($destination) | Should -Be 'OTHER ARCHIVE' }
+        else { Test-Path -LiteralPath $destination -PathType Container | Should -BeTrue }
+        Should -Invoke Remove-Item -Times 0 -ParameterFilter { $LiteralPath -eq $destination }
+    }
+    It 'preserves the backup when a destination appears during restoration' {
+        Mock Invoke-DriverArchiveReplacement {
+            [IO.File]::Move($Destination, $Backup)
+            throw 'partial replacement failure'
+        }
+        Mock Test-Path {
+            [IO.File]::WriteAllText($LiteralPath, 'CONCURRENT ARCHIVE')
+            return $false
+        } -ParameterFilter { $LiteralPath -eq $destination -and $ErrorAction -eq 'Stop' }
+        $failure = { Publish-DriverArchive -Source $source -Destination $destination } |
+            Should -Throw '*Automatic restore failed*' -PassThru
+        [IO.File]::ReadAllText($destination) | Should -Be 'CONCURRENT ARCHIVE'
+        $backups = @(Get-ChildItem -LiteralPath $cache -Force -Filter '*.bak')
+        $backups.Count | Should -Be 1
+        [IO.File]::ReadAllText($backups[0].FullName) | Should -Be 'OLD ARCHIVE'
+        $failure.Exception.Message.Contains($backups[0].FullName) | Should -BeTrue
+        $failure.Exception.Message.Contains($source) | Should -BeTrue
+    }
+    It 'identifies a retained backup when cleanup fails after successful replacement' {
+        Mock Remove-Item { throw 'backup cleanup denied' } -ParameterFilter { $LiteralPath -like '*.bak' }
+        $failure = { Publish-DriverArchive -Source $source -Destination $destination } |
+            Should -Throw '*backup cleanup failed*backup cleanup denied*' -PassThru
+        [IO.File]::ReadAllText($destination) | Should -Be 'NEW ARCHIVE'
+        $backups = @(Get-ChildItem -LiteralPath $cache -Force -Filter '*.bak')
+        $backups.Count | Should -Be 1
+        [IO.File]::ReadAllText($backups[0].FullName) | Should -Be 'OLD ARCHIVE'
+        $failure.Exception.Message.Contains($backups[0].FullName) | Should -BeTrue
     }
     It 'leaves no initial cache or receipt when publication fails' {
         Remove-Item -LiteralPath $destination, "$destination.hash"

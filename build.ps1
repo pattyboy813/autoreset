@@ -1359,6 +1359,15 @@ function Get-DriverSourceHash {
     return Get-BuildPartsHash -Parts $parts
 }
 
+function Invoke-DriverArchiveReplacement {
+    param(
+        [Parameter(Mandatory)][string]$Stage,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$Backup
+    )
+    [IO.File]::Replace($Stage, $Destination, $Backup)
+}
+
 function Move-DriverArchiveStage {
     param(
         [Parameter(Mandatory)][string]$Stage,
@@ -1376,8 +1385,45 @@ function Move-DriverArchiveStage {
         throw 'Driver archive replacement requires regular files.'
     }
     if (Test-Path -LiteralPath $Destination -PathType Leaf) {
-        # Never delete the cache first; filesystems without Replace support fail closed.
-        [IO.File]::Replace($Stage, $Destination, [NullString]::Value)
+        $backup = Join-Path (Split-Path -Parent $Destination) ('.driver-backup-' + [guid]::NewGuid().ToString('N') + '.bak')
+        Assert-NoReparsePath -Path $backup
+        if (Test-Path -LiteralPath $backup) { throw "Driver archive backup already exists: $backup" }
+        try {
+            # Replace can move the old destination aside before failing (Windows error 1176).
+            Invoke-DriverArchiveReplacement -Stage $Stage -Destination $Destination -Backup $backup
+        }
+        catch {
+            $replacementError = $_.Exception.Message
+            $recovery = "Inspect recovery backup at '$backup' if present."
+            try {
+                Assert-NoReparsePath -Path $backup
+                Assert-NoReparsePath -Path $Destination
+                if (Test-Path -LiteralPath $backup -PathType Leaf -ErrorAction Stop) {
+                    if (-not (Test-Path -LiteralPath $Destination -ErrorAction Stop)) {
+                        # The two-argument Move cannot overwrite a destination that appears meanwhile.
+                        [IO.File]::Move($backup, $Destination)
+                        $recovery = "Previous archive restored at '$Destination'."
+                    }
+                    else {
+                        $recovery = "Recovery backup retained at '$backup'; existing destination left untouched."
+                    }
+                }
+                else { $recovery = 'No replacement backup was created.' }
+            }
+            catch {
+                $recovery = "Automatic restore failed; recovery backup retained at '$backup' if present: $($_.Exception.Message)"
+            }
+            throw "Driver archive replacement failed: $replacementError $recovery"
+        }
+        try {
+            if (Test-Path -LiteralPath $backup) {
+                Assert-NoReparsePath -Path $backup
+                Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
+            }
+        }
+        catch {
+            throw "Driver archive replaced but backup cleanup failed; inspect recovery backup at '$backup': $($_.Exception.Message)"
+        }
     }
     else { [IO.File]::Move($Stage, $Destination) }
 }
